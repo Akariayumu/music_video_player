@@ -17,6 +17,7 @@ const state = {
   lyrics: [],
   lyricsVisible: false,
   quality: 'standard', // 'standard' | 'exhigh' | 'SQ' | 'lossless' | 'hires'
+  mvMode: false,
 };
 
 // Quality mappings
@@ -175,6 +176,7 @@ function renderPlaylist() {
 // ===== Load & Play =====
 function loadTrack(index) {
   if (index < 0 || index >= state.playlist.length) return;
+  hideMVPlayer();
   state.currentIndex = index;
   const track = state.playlist[index];
 
@@ -204,18 +206,43 @@ function loadTrack(index) {
 
   // For online tracks, fetch URL if needed
   if (track.type === 'online' && !track.url) {
-    const fetchUrl = track.source === 'kuwo'
-      ? fetchKuwoPlayUrl(track.name, track.artist)
-      : fetchSongUrl(track.id);
-    fetchUrl.then(url => {
-      if (url) {
-        track.url = url;
-        audio.src = url;
-        audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-      } else {
-        toast('无法获取播放链接，请检查网络', true);
+    if (track.source === 'kuwo') {
+      // Prevent retry loop
+      if (track._kuwoFailed) {
+        toast('该歌曲暂不可用，请尝试其他音质或其他歌曲', true);
+        return;
       }
-    });
+      fetchKuwoDetailWithFallback(track.name, track.artist).then(({ url, cover }) => {
+        if (cover && !track.cover) {
+          track.cover = cover;
+          const img = $('coverArt');
+          img.src = cover;
+          img.onload = () => { img.classList.add('loaded'); $('coverPlaceholder').classList.add('hidden'); };
+          img.onerror = () => { img.classList.remove('loaded'); $('coverPlaceholder').classList.add('hidden'); };
+        }
+        if (url) {
+          track.url = kuwoProxyUrl(url);
+          audio.src = track.url;
+          // Delay auto-play 500ms to let the user see the cover
+          setTimeout(() => {
+            audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          }, 500);
+        } else {
+          track._kuwoFailed = true;
+          toast('该歌曲暂不可用', true);
+        }
+      });
+    } else {
+      fetchSongUrl(track.id).then(url => {
+        if (url) {
+          track.url = url;
+          audio.src = url;
+          audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+        } else {
+          toast('无法获取播放链接，请检查网络', true);
+        }
+      });
+    }
   } else if (track.url) {
     audio.src = track.url;
   }
@@ -252,7 +279,9 @@ function setPlaying(val) {
   const playBtn = $('playBtn');
   playBtn.querySelector('.icon-play').classList.toggle('hidden', val);
   playBtn.querySelector('.icon-pause').classList.toggle('hidden', !val);
-  $('coverWrapper').parentElement.classList.toggle('playing', val);
+  if (!state.mvMode) {
+    $('coverWrapper').parentElement.classList.toggle('playing', val);
+  }
 }
 
 function resetPlayer() {
@@ -329,11 +358,50 @@ audio.addEventListener('pause', () => {
   setPlaying(false);
 });
 
-audio.addEventListener('error', () => {
+audio.addEventListener('error', (e) => {
   const t = state.playlist[state.currentIndex];
+  // Ignore errors when audio is empty
+  if (!audio.src || audio.src === window.location.href) return;
   if (t && t.type === 'online') {
-    toast('播放失败，尝试重新获取链接…', true);
+    // If kuwo source fails due to CORS, try to fallback to netease
+    if (t.source === 'kuwo' && !t._kuwoFailed) {
+      t._kuwoFailed = true;
+      toast('酷我音源不可用，尝试切换到网易云…', true);
+      // Search same song on netease
+      const keywords = `${t.name} ${t.artist}`;
+      fetch(`/api/search?keywords=${encodeURIComponent(keywords)}&limit=1`)
+        .then(r => r.json())
+        .then(data => {
+          const songs = data.result?.songs || [];
+          if (songs.length > 0) {
+            const s = songs[0];
+            t.id = String(s.id);
+            t.source = 'netease';
+            t.url = null;
+            t._kuwoFailed = false;
+            t._retryCount = 0;
+            loadTrack(state.currentIndex);
+          } else {
+            toast('网易云也无此歌曲', true);
+            setPlaying(false);
+          }
+        })
+        .catch(() => {
+          toast('切换音源失败', true);
+          setPlaying(false);
+        });
+      return;
+    }
+    if (t._kuwoFailed) return;
+    t._retryCount = (t._retryCount || 0) + 1;
+    if (t._retryCount > 3) {
+      t._kuwoFailed = true;
+      setPlaying(false);
+      toast('播放失败，该歌曲暂不可用', true);
+      return;
+    }
     t.url = null;
+    toast('播放失败，尝试重新获取链接…', true);
     loadTrack(state.currentIndex);
   }
 });
@@ -561,6 +629,38 @@ async function fetchSongUrl(id) {
   } catch { return null; }
 }
 
+function kuwoProxyUrl(url) {
+  if (!url) return url;
+  return `/api/kuwo/audio?url=${encodeURIComponent(url)}`;
+}
+
+async function fetchKuwoDetail(name, artist, quality = state.quality) {
+  try {
+    const msg = artist ? `${name} ${artist}` : name;
+    const size = QUALITY_KUWO_SIZE[quality] || '128kmp3';
+    const res = await fetch(`/api/kuwo/detail?msg=${encodeURIComponent(msg)}&n=1&size=${encodeURIComponent(size)}`);
+    const data = await res.json();
+    return { url: data.url || null, cover: data.picture || '' };
+  } catch { return { url: null, cover: '' }; }
+}
+
+async function fetchKuwoDetailWithFallback(name, artist) {
+  const QUALITY_ORDER = ['hires', 'lossless', 'SQ', 'exhigh', 'standard'];
+  const startIdx = QUALITY_ORDER.indexOf(state.quality);
+  const qualitiesToTry = QUALITY_ORDER.slice(startIdx >= 0 ? startIdx : 0);
+
+  for (const quality of qualitiesToTry) {
+    const result = await fetchKuwoDetail(name, artist, quality);
+    if (result.url) {
+      if (quality !== state.quality) {
+        toast(`${QUALITY_LABEL[state.quality]} 不可用，已降级至 ${QUALITY_LABEL[quality]}`);
+      }
+      return result;
+    }
+  }
+  return { url: null, cover: '' };
+}
+
 async function fetchKuwoPlayUrl(name, artist) {
   try {
     const keywords = artist ? `${name} ${artist}` : name;
@@ -750,8 +850,8 @@ function setQuality(quality) {
     if (track.source === 'kuwo') {
       fetchKuwoPlayUrl(track.name, track.artist).then(url => {
         if (url) {
-          track.url = url;
-          audio.src = url;
+          track.url = kuwoProxyUrl(url);
+          audio.src = track.url;
           audio.currentTime = currentTime;
           if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
@@ -773,6 +873,61 @@ function setQuality(quality) {
   }
 
   toast(`音质: ${QUALITY_LABEL[quality]}`);
+}
+
+// ===== Bilibili MV =====
+async function fetchBiliMV(name, artist) {
+  const shortName = name.slice(0, 30);
+  const query = encodeURIComponent(`${shortName} ${artist} MV`);
+  const res = await fetch(`/api/bilibili?msg=${query}&n=1`);
+  const json = await res.json();
+  if (json.code !== 200) throw new Error(json.msg || '搜索失败');
+  const data = json.data || {};
+  const url = data.url || '';
+  const match = url.match(/BV[\w]+/);
+  return { bvid: match ? match[0] : null, title: data.title || name };
+}
+
+function showMVPlayer(bvid, title) {
+  const overlay = $('mvOverlay');
+  $('mvTitle').textContent = title || '';
+  $('mvIframeContainer').innerHTML = `<iframe src="//player.bilibili.com/player.html?bvid=${bvid}&page=1&autoplay=1&high_quality=1&danmaku=0" frameborder="0" allowfullscreen></iframe>`;
+  overlay.classList.remove('hidden');
+  state.mvMode = true;
+  // Pause cover rotation while watching MV
+  $('coverWrapper').parentElement.classList.remove('playing');
+}
+
+function hideMVPlayer() {
+  if (!state.mvMode) return;
+  $('mvIframeContainer').innerHTML = '<div class="mv-loading" id="mvLoading">搜索视频中…</div>';
+  $('mvOverlay').classList.add('hidden');
+  state.mvMode = false;
+  // Restore cover spin if playing
+  $('coverWrapper').parentElement.classList.toggle('playing', state.isPlaying);
+}
+
+async function handleCoverClick() {
+  const track = state.playlist[state.currentIndex];
+  if (!track) { toast('请先选择一首歌曲', true); return; }
+
+  const overlay = $('mvOverlay');
+  $('mvTitle').textContent = `${track.name} - ${track.artist || ''}`;
+  $('mvIframeContainer').innerHTML = '<div class="mv-loading">搜索视频中…</div>';
+  overlay.classList.remove('hidden');
+  state.mvMode = true;
+  $('coverWrapper').parentElement.classList.remove('playing');
+
+  try {
+    const { bvid, title } = await fetchBiliMV(track.name, track.artist || '');
+    if (!bvid) {
+      $('mvIframeContainer').innerHTML = '<div class="mv-loading">未找到相关MV</div>';
+      return;
+    }
+    showMVPlayer(bvid, title || `${track.name} MV`);
+  } catch (e) {
+    $('mvIframeContainer').innerHTML = '<div class="mv-loading">搜索失败，请检查网络</div>';
+  }
 }
 
 // ===== Event Bindings =====
@@ -886,6 +1041,13 @@ function init() {
       $('qualityDropdown').classList.add('hidden');
     }
   });
+
+  // MV cover click
+  $('coverContainer').addEventListener('click', e => {
+    if (state.mvMode) return;
+    handleCoverClick();
+  });
+  $('mvClose').addEventListener('click', hideMVPlayer);
 
   // Lyrics
   $('lyricsToggle').addEventListener('click', () => {

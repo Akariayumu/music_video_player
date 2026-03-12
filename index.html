@@ -164,7 +164,13 @@
       <div class="player-area">
 
         <!-- Cover Art -->
-        <div class="cover-container">
+        <div class="cover-container" id="coverContainer">
+          <div class="cover-mv-hint" id="coverMvHint">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+              <polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/>
+            </svg>
+            <span>看MV</span>
+          </div>
           <div class="cover-wrapper" id="coverWrapper">
             <img src="" alt="Album cover" id="coverArt" class="cover-art">
             <div class="cover-placeholder" id="coverPlaceholder">
@@ -268,6 +274,22 @@
         </div>
 
       </div><!-- end player-area -->
+
+      <!-- MV Overlay -->
+      <div class="mv-overlay hidden" id="mvOverlay">
+        <div class="mv-header">
+          <div class="mv-title" id="mvTitle"></div>
+          <button class="mv-back-btn" id="mvClose">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <path d="M19 12H5M12 5l-7 7 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            返回封面
+          </button>
+        </div>
+        <div class="mv-iframe-container" id="mvIframeContainer">
+          <div class="mv-loading" id="mvLoading">搜索视频中…</div>
+        </div>
+      </div>
 
       <!-- Lyrics Overlay -->
       <div class="lyrics-overlay hidden" id="lyricsOverlay">

@@ -7,7 +7,14 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname)));
+// Disable cache for JS files to prevent stale code
+app.use(express.static(path.join(__dirname), {
+  setHeaders: (res, path) => {
+    if (path.endsWith('.js') || path.endsWith('.css')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+  }
+}));
 
 // Lazy-load NeteaseCloudMusicApi
 let NeteaseAPI = null;
@@ -144,6 +151,67 @@ app.get('/api/song/url/kuwo', async (req, res) => {
   }
 });
 
+// Get Kuwo song detail (cover + URL) by keywords and index
+app.get('/api/kuwo/detail', async (req, res) => {
+  try {
+    const { msg, n = 1, size = 'standard' } = req.query;
+    if (!msg) return res.json({ code: 400, message: 'msg required' });
+
+    const https = require('https');
+    const url = `https://api.yaohud.cn/api/music/kuwo?key=dv8JqaGywPNfPG4g1bK&msg=${encodeURIComponent(msg)}&n=${n}&size=${encodeURIComponent(size)}`;
+
+    const data = await new Promise((resolve, reject) => {
+      https.get(url, (response) => {
+        let body = '';
+        response.on('data', chunk => body += chunk);
+        response.on('end', () => {
+          try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+        });
+      }).on('error', reject);
+    });
+
+    // Handle Kuwo API error (code can be string "400" or number 400)
+    if (data.code == 400 || data.code === '400') {
+      return res.json({ code: 404, message: data.msg || '未找到歌曲', picture: '', url: null });
+    }
+
+    const result = data?.data || {};
+    res.json({
+      code: 200,
+      picture: result.picture || '',
+      url: result.vipmusic?.url || null
+    });
+  } catch (err) {
+    console.error('Kuwo detail error:', err.message);
+    res.status(500).json({ code: 500, message: err.message });
+  }
+});
+
+// Proxy Kuwo audio stream to bypass CORS
+app.get('/api/kuwo/audio', (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send('url parameter required');
+
+  const https = require('https');
+  const http = require('http');
+  const client = url.startsWith('https') ? https : http;
+
+  const request = client.get(url, (audioRes) => {
+    res.setHeader('Content-Type', audioRes.headers['content-type'] || 'audio/mpeg');
+    if (audioRes.headers['content-length']) {
+      res.setHeader('Content-Length', audioRes.headers['content-length']);
+    }
+    if (audioRes.headers['accept-ranges']) {
+      res.setHeader('Accept-Ranges', audioRes.headers['accept-ranges']);
+    }
+    res.statusCode = audioRes.statusCode || 200;
+    audioRes.pipe(res);
+  });
+  request.on('error', (err) => {
+    if (!res.headersSent) res.status(500).send('Proxy error: ' + err.message);
+  });
+});
+
 // Get hot search
 app.get('/api/search/hot', async (req, res) => {
   try {
@@ -175,6 +243,35 @@ app.get('/api/playlist/track/all', async (req, res) => {
     const { id, limit = 50 } = req.query;
     const result = await api.playlist_track_all({ id, limit: parseInt(limit), cookie: '' });
     res.json(result.body || result);
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message });
+  }
+});
+
+// Bilibili video search
+app.get('/api/bilibili', async (req, res) => {
+  try {
+    const https = require('https');
+    const { msg, n = 1 } = req.query;
+    if (!msg) return res.json({ code: 400, message: 'msg required' });
+
+    const apiKey = 'dv8JqaGywPNfPG4g1bK';
+    const url = `https://api.yaohud.cn/api/v5/bilibili?key=${apiKey}&msg=${encodeURIComponent(msg)}&n=${n}`;
+
+    https.get(url, (apiRes) => {
+      let data = '';
+      apiRes.on('data', chunk => data += chunk);
+      apiRes.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          res.json(json);
+        } catch (e) {
+          res.status(500).json({ code: 500, message: 'Parse error' });
+        }
+      });
+    }).on('error', (err) => {
+      res.status(500).json({ code: 500, message: err.message });
+    });
   } catch (err) {
     res.status(500).json({ code: 500, message: err.message });
   }
