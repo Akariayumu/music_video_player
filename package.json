@@ -1,0 +1,15 @@
+{
+  "name": "web-music-player",
+  "version": "1.0.0",
+  "description": "Beautiful web music player with local & online music support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "NeteaseCloudMusicApi": "^4.15.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
