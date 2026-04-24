@@ -204,6 +204,31 @@ app.get('/api/kuwo/audio', (req, res) => {
   });
 });
 
+// Proxy NetEase audio stream to bypass CORS
+app.get('/api/netease/audio', (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send('url parameter required');
+
+  const https = require('https');
+  const http = require('http');
+  const client = url.startsWith('https') ? https : http;
+
+  const request = client.get(url, { headers: { 'Referer': 'https://music.163.com/' } }, (audioRes) => {
+    res.setHeader('Content-Type', audioRes.headers['content-type'] || 'audio/mpeg');
+    if (audioRes.headers['content-length']) {
+      res.setHeader('Content-Length', audioRes.headers['content-length']);
+    }
+    if (audioRes.headers['accept-ranges']) {
+      res.setHeader('Accept-Ranges', audioRes.headers['accept-ranges']);
+    }
+    res.statusCode = audioRes.statusCode || 200;
+    audioRes.pipe(res);
+  });
+  request.on('error', (err) => {
+    if (!res.headersSent) res.status(500).send('Proxy error: ' + err.message);
+  });
+});
+
 // Get hot search
 app.get('/api/search/hot', async (req, res) => {
   try {

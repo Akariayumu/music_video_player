@@ -248,8 +248,9 @@ function loadTrack(index) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          track.url = url;
-          audio.src = url;
+          const proxyUrl = neteaseProxyUrl(url);
+          track.url = proxyUrl;
+          audio.src = proxyUrl;
           audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
           toast('无法获取播放链接，请检查网络', true);
@@ -656,6 +657,11 @@ function kuwoProxyUrl(url) {
   return `/api/kuwo/audio?url=${encodeURIComponent(url)}`;
 }
 
+function neteaseProxyUrl(url) {
+  if (!url) return url;
+  return `/api/netease/audio?url=${encodeURIComponent(url)}`;
+}
+
 async function fetchKuwoDetail(name, artist, quality = state.quality) {
   try {
     const msg = artist ? `${name} ${artist}` : name;
@@ -950,8 +956,9 @@ function setQuality(quality) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          track.url = url;
-          audio.src = url;
+          const proxyUrl = neteaseProxyUrl(url);
+          track.url = proxyUrl;
+          audio.src = proxyUrl;
           audio.currentTime = currentTime;
           if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
