@@ -248,9 +248,9 @@ function loadTrack(index) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          const proxyUrl = neteaseProxyUrl(url);
-          track.url = proxyUrl;
-          audio.src = proxyUrl;
+          // Direct URL - <audio> tag doesn't need CORS for playback
+          track.url = url;
+          audio.src = url;
           audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
           toast('无法获取播放链接，请检查网络', true);
@@ -585,7 +585,7 @@ async function searchSongs(keywords, offset = 0) {
         _dedupKey: (song.name + '|' + (song.singer || '')).toLowerCase()
       }));
 
-    // Merge: prioritize kuwo first (NetEase URLs are IP-restricted and fail through proxy)
+    // Merge: kuwo first (no IP restriction), then netease (browser can access directly)
     const merged = [...kuwoTracks, ...neteaseTracks];
 
     if (merged.length === 0 && offset === 0) {
@@ -951,9 +951,9 @@ function setQuality(quality) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          const proxyUrl = neteaseProxyUrl(url);
-          track.url = proxyUrl;
-          audio.src = proxyUrl;
+          // Direct URL - <audio> tag doesn't need CORS for playback
+          track.url = url;
+          audio.src = url;
           audio.currentTime = currentTime;
           if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
