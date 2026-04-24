@@ -7,14 +7,6 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-// Disable cache for JS files to prevent stale code
-app.use(express.static(path.join(__dirname), {
-  setHeaders: (res, path) => {
-    if (path.endsWith('.js') || path.endsWith('.css')) {
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    }
-  }
-}));
 
 // Lazy-load NeteaseCloudMusicApi
 let NeteaseAPI = null;
@@ -236,6 +228,20 @@ app.get('/api/artist/songs', async (req, res) => {
   }
 });
 
+// Playlist detail (basic info: name, cover, description)
+app.get('/api/playlist/detail', async (req, res) => {
+  try {
+    const api = await getAPI();
+    const { id } = req.query;
+    if (!id) return res.json({ code: 400, message: 'id required' });
+    const result = await api.playlist_detail({ id, cookie: '' });
+    res.json(result.body || result);
+  } catch (err) {
+    console.error('Playlist detail error:', err.message);
+    res.status(500).json({ code: 500, message: err.message });
+  }
+});
+
 // Playlist tracks
 app.get('/api/playlist/track/all', async (req, res) => {
   try {
@@ -248,31 +254,98 @@ app.get('/api/playlist/track/all', async (req, res) => {
   }
 });
 
-// Bilibili video search
+// Bilibili video search with fallback
 app.get('/api/bilibili', async (req, res) => {
   try {
     const https = require('https');
-    const { msg, n = 1 } = req.query;
+    const { msg } = req.query;
     if (!msg) return res.json({ code: 400, message: 'msg required' });
 
     const apiKey = 'dv8JqaGywPNfPG4g1bK';
-    const url = `https://api.yaohud.cn/api/v5/bilibili?key=${apiKey}&msg=${encodeURIComponent(msg)}&n=${n}`;
 
-    https.get(url, (apiRes) => {
-      let data = '';
-      apiRes.on('data', chunk => data += chunk);
-      apiRes.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          res.json(json);
-        } catch (e) {
-          res.status(500).json({ code: 500, message: 'Parse error' });
+    const httpsGet = (url) => new Promise((resolve, reject) => {
+      const options = { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } };
+      https.get(url, options, (apiRes) => {
+        let data = '';
+        apiRes.on('data', chunk => data += chunk);
+        apiRes.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('Parse error')); }
+        });
+      }).on('error', reject);
+    });
+
+    // Try yaohud v5 API, attempt n=1 to n=3 until we get a BV number
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const url = `https://api.yaohud.cn/api/v5/bilibili?key=${apiKey}&msg=${encodeURIComponent(msg)}&n=${attempt}`;
+        const json = await httpsGet(url);
+        if (json.code === 200 && (json.data?.url || '').match(/BV[\w]+/)) {
+          return res.json(json);
         }
-      });
-    }).on('error', (err) => {
-      res.status(500).json({ code: 500, message: err.message });
+      } catch (e) {
+        console.error(`yaohud bilibili attempt ${attempt} failed:`, e.message);
+      }
+    }
+
+    // Fallback: B站官方搜索 API
+    try {
+      const biliUrl = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(msg)}`;
+      const biliData = await httpsGet(biliUrl);
+      const results = biliData?.data?.result || [];
+      for (const item of results.slice(0, 5)) {
+        if (item.bvid) {
+          return res.json({
+            code: 200,
+            data: {
+              url: `https://www.bilibili.com/video/${item.bvid}`,
+              title: (item.title || msg).replace(/<[^>]+>/g, ''),
+              bvid: item.bvid
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.error('Bilibili official API failed:', e.message);
+    }
+
+    res.json({ code: 404, message: '未找到相关视频' });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message });
+  }
+});
+
+// Bilibili video parse via yaohud v6 API (returns MP4 direct link)
+app.get('/api/bilibili/mir6', async (req, res) => {
+  try {
+    const { bvid } = req.query;
+    if (!bvid) return res.json({ code: 400, message: 'bvid required' });
+
+    // Use yaohud API via curl
+    const biliUrl = `https://www.bilibili.com/video/${bvid}`;
+    const apiKey = 'dv8JqaGywPNfPG4g1bK';
+    const apiUrl = `https://api.yaohud.cn/api/v6/video/bili?key=${apiKey}&url=${encodeURIComponent(biliUrl)}`;
+    
+    const { execSync } = require('child_process');
+    const result = execSync(`curl -s "${apiUrl}"`, { encoding: 'utf8', timeout: 15000 });
+    console.log('API URL:', apiUrl);
+    console.log('Result:', result.slice(0, 200));
+    const data = JSON.parse(result);
+
+    console.log('Bili parse response:', JSON.stringify(data).slice(0, 100));
+    
+    // Check if response has data.video_url
+    const videoUrl = data.data?.video_url;
+    if (!videoUrl) {
+      return res.json({ code: 404, message: '解析失败，未获取到视频链接' });
+    }
+
+    res.json({
+      code: 200,
+      video_url: videoUrl,
+      accept: ['高清 720P']
     });
   } catch (err) {
+    console.error('Bili parse error:', err.message);
     res.status(500).json({ code: 500, message: err.message });
   }
 });
@@ -281,6 +354,15 @@ app.get('/api/bilibili', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+// Static files (after API routes)
+app.use(express.static(path.join(__dirname), {
+  setHeaders: (res, path) => {
+    if (path.endsWith('.js') || path.endsWith('.css')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+  }
+}));
 
 // Serve frontend
 app.get('*', (req, res) => {
