@@ -585,13 +585,8 @@ async function searchSongs(keywords, offset = 0) {
         _dedupKey: (song.name + '|' + (song.singer || '')).toLowerCase()
       }));
 
-    // Merge: interleave for balanced relevance ordering
-    const merged = [];
-    const maxLen = Math.max(neteaseTracks.length, kuwoTracks.length);
-    for (let i = 0; i < maxLen; i++) {
-      if (i < neteaseTracks.length) merged.push(neteaseTracks[i]);
-      if (i < kuwoTracks.length) merged.push(kuwoTracks[i]);
-    }
+    // Merge: prioritize kuwo first (NetEase URLs are IP-restricted and fail through proxy)
+    const merged = [...kuwoTracks, ...neteaseTracks];
 
     if (merged.length === 0 && offset === 0) {
       results.innerHTML = '<p class="loading-text">无结果</p>';
