@@ -234,8 +234,9 @@ function loadTrack(index) {
           img.onerror = () => { img.classList.remove('loaded'); $('coverPlaceholder').classList.add('hidden'); };
         }
         if (url) {
-          track.url = kuwoProxyUrl(url);
-          audio.src = track.url;
+          // Try direct URL first, audio error handler will retry via proxy if needed
+          track.url = url;
+          audio.src = url;
           // Delay auto-play 500ms to let the user see the cover
           setTimeout(() => {
             audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
@@ -248,7 +249,6 @@ function loadTrack(index) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          // Direct URL - <audio> tag doesn't need CORS for playback
           track.url = url;
           audio.src = url;
           audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
@@ -385,6 +385,32 @@ audio.addEventListener('error', (e) => {
   const t = state.playlist[state.currentIndex];
   // Ignore errors when audio is empty
   if (!audio.src || audio.src === window.location.href) return;
+
+  // If this track was already proxied, skip retry
+  if (t && t._proxied) return;
+
+  // If direct URL failed and we have a proxy, retry via proxy
+  if (t && t.url && !t._proxyAttempted) {
+    t._proxyAttempted = true;
+    let proxyUrl = null;
+    if (t.source === 'netease') {
+      proxyUrl = neteaseProxyUrl(t.url);
+    } else if (t.source === 'kuwo') {
+      proxyUrl = kuwoProxyUrl(t.url);
+    }
+    if (proxyUrl && t.url !== proxyUrl) {
+      // Retry with proxy
+      const wasPlaying = state.isPlaying;
+      audio.src = proxyUrl;
+      audio.load();
+      if (wasPlaying) {
+        setTimeout(() => audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false)), 300);
+      }
+      toast('直接播放失败，已通过服务器中转', true);
+      return;
+    }
+  }
+
   if (t && t.type === 'online') {
     // If kuwo source fails due to CORS, try to fallback to netease
     if (t.source === 'kuwo' && !t._kuwoFailed) {
@@ -403,6 +429,7 @@ audio.addEventListener('error', (e) => {
             t.url = null;
             t._kuwoFailed = false;
             t._retryCount = 0;
+            t._proxyAttempted = false;
             loadTrack(state.currentIndex);
           } else {
             toast('网易云也无此歌曲', true);
@@ -937,10 +964,11 @@ function setQuality(quality) {
     const wasPlaying = state.isPlaying;
     const currentTime = audio.currentTime;
     track.url = null; // Force re-fetch
+    track._proxyAttempted = false; // Reset proxy flag for retry
     if (track.source === 'kuwo') {
       fetchKuwoPlayUrl(track.name, track.artist).then(url => {
         if (url) {
-          track.url = kuwoProxyUrl(url);
+          track.url = url;
           audio.src = track.url;
           audio.currentTime = currentTime;
           if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
@@ -951,7 +979,6 @@ function setQuality(quality) {
     } else {
       fetchSongUrl(track.id).then(url => {
         if (url) {
-          // Direct URL - <audio> tag doesn't need CORS for playback
           track.url = url;
           audio.src = url;
           audio.currentTime = currentTime;
