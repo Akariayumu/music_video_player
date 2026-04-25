@@ -126,11 +126,11 @@ img { display: block; }
 
 .panels { flex: 1; overflow: hidden; position: relative; }
 .panel { display: none; flex-direction: column; height: 100%; overflow: hidden; }
-.panel.active { display: flex; animation: panelFadeIn 0.22s ease; }
+.panel.active { display: flex; animation: panelSlideIn 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
 
-@keyframes panelFadeIn {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
+@keyframes panelSlideIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .panel-header {
@@ -341,13 +341,14 @@ img { display: block; }
   padding: 8px 10px;
   border-radius: 10px;
   cursor: pointer;
-  transition: background var(--transition);
-  animation: resultItemIn 0.28s ease both;
+  transition: background var(--transition), transform 0.1s ease;
+  animation: resultItemIn 0.3s cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 .search-result-item:hover { background: var(--surface-hover); }
+.search-result-item:active { transform: scale(0.98); }
 
 @keyframes resultItemIn {
-  from { opacity: 0; transform: translateX(-10px); }
+  from { opacity: 0; transform: translateX(-12px); }
   to   { opacity: 1; transform: translateX(0); }
 }
 
@@ -373,11 +374,12 @@ img { display: block; }
   border-radius: 6px;
   color: var(--text-muted);
   opacity: 0;
-  transition: all var(--transition);
+  transition: all var(--transition), transform 0.1s ease;
   flex-shrink: 0;
 }
 .search-result-item:hover .result-add { opacity: 1; }
 .result-add:hover { color: var(--accent); background: rgba(124,106,247,0.15); }
+.result-add:active { transform: scale(0.85); }
 .source-tag { display: inline-block; font-size: 10px; padding: 1px 5px; border-radius: 4px; vertical-align: middle; font-weight: 600; margin-left: 4px; }
 .netease-tag { background: rgba(231,65,65,0.15); color: #e74141; }
 .kuwo-tag { background: rgba(0,163,255,0.15); color: #00a3ff; }
@@ -598,12 +600,12 @@ img { display: block; }
   position: relative;
   width: clamp(160px, 28vh, 260px);
   flex-shrink: 0;
-  transition: opacity 0.3s ease, transform 0.3s ease;
+  transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1), transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .player-area.mv-mode .cover-container {
   opacity: 0;
-  transform: scale(0.9);
+  transform: scale(0.85);
   pointer-events: none;
 }
 
@@ -615,6 +617,7 @@ img { display: block; }
   overflow: visible;
   animation: coverSpin 20s linear infinite paused;
   transform-origin: center center;
+  will-change: transform;
 }
 
 .playing .cover-wrapper {
@@ -672,6 +675,7 @@ img { display: block; }
   pointer-events: none;
   z-index: 0;
   opacity: 0.6;
+  transition: opacity 0.3s ease;
 }
 
 .song-info { text-align: center; width: 100%; max-width: 380px; }
@@ -1093,7 +1097,7 @@ img { display: block; }
   flex-direction: column;
   opacity: 0;
   transform: translateX(100%);
-  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
 }
 .mv-full-panel.active {
@@ -1208,6 +1212,10 @@ img { display: block; }
 .hot-tag:active { transform: scale(0.93); }
 .search-btn { transition: opacity var(--transition), transform 0.1s ease; }
 .search-btn:active { transform: scale(0.92); }
+.quality-option { transition: all var(--transition), transform 0.1s ease; }
+.quality-option:active { transform: scale(0.95); }
+.mv-quality-btn { transition: all var(--transition), transform 0.1s ease; }
+.mv-quality-btn:active { transform: scale(0.92); }
 
 /* ===== Search Loading Spinner ===== */
 .loading-text.searching {
@@ -1245,6 +1253,15 @@ img { display: block; }
   animation: spin 0.8s linear infinite;
 }
 
+/* ===== Cover Art Loading ===== */
+.cover-art {
+  transition: opacity 0.3s ease;
+  opacity: 0;
+}
+.cover-art.loaded {
+  opacity: 1;
+}
+
 /* ===== Sidebar Backdrop (mobile) ===== */
 .sidebar-backdrop {
   display: none;
@@ -1252,10 +1269,11 @@ img { display: block; }
   inset: 0;
   background: rgba(0,0,0,0.55);
   z-index: 99;
+  will-change: opacity;
 }
 .sidebar-backdrop.active {
   display: block;
-  animation: backdropIn 0.25s ease;
+  animation: backdropIn 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 @keyframes backdropIn {
   from { opacity: 0; }

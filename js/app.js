@@ -1,34 +1,139 @@
-/* ===== Music Player App ===== */
+/**
+ * @file Music Player App — refactored with modular architecture,
+ *       unified API client, AbortController-based cancellation,
+ *       debounced search, localStorage persistence, and JSDoc types.
+ */
 
+import {
+  searchNetEase, searchKuwo, getSongUrl, getSongDetail,
+  getLyric, getKuwoDetail, getKuwoPlayUrl, searchBiliMV,
+  getHotSearches, getPlaylistDetail, getPlaylistTracks,
+  cancelRequests, cancelRequest, kuwoProxyUrl, neteaseProxyUrl,
+} from './api.js';
+
+import {
+  loadSettings, saveVolume, saveShuffle, saveRepeat, saveQuality,
+} from './storage.js';
+
+/* ===== Helpers ===== */
+
+/** @type {(id: string) => HTMLElement} */
 const $ = id => document.getElementById(id);
 
-// ===== State =====
+/**
+ * Format seconds to m:ss.
+ * @param {number} s
+ * @returns {string}
+ */
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Escape HTML.
+ * @param {string} s
+ * @returns {string}
+ */
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Show a toast notification.
+ * @param {string} msg
+ * @param {boolean} [isError=false]
+ */
+function toast(msg, isError = false) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (isError ? ' error' : '');
+  t.textContent = msg;
+  $('toastContainer').appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+/* ===== Quality Mappings ===== */
+
+const QUALITY_BR = { standard: 128000, exhigh: 320000, SQ: 999000, lossless: 999000, hires: 999000 };
+const QUALITY_KUWO_SIZE = { standard: '128kmp3', exhigh: '320kmp3', SQ: '2000kflac', lossless: '2000kflac', hires: 'hires' };
+const QUALITY_LABEL = { standard: '标准', exhigh: '极高', SQ: '超品', lossless: '无损', hires: 'Hi-Res' };
+
+/* ===== State ===== */
+
+/**
+ * @typedef {Object} Track
+ * @property {string} id
+ * @property {string} name
+ * @property {string} artist
+ * @property {string} album
+ * @property {string} cover
+ * @property {number} duration
+ * @property {'local'|'online'} type
+ * @property {'netease'|'kuwo'|''} [source]
+ * @property {string|null} [url]
+ * @property {string} [_dedupKey]
+ */
+
+/**
+ * @typedef {Object} PlayerState
+ * @property {Track[]} playlist
+ * @property {number} currentIndex
+ * @property {boolean} isPlaying
+ * @property {boolean} shuffle
+ * @property {'none'|'all'|'one'} repeat
+ * @property {number} volume
+ * @property {boolean} muted
+ * @property {boolean} seeking
+ * @property {boolean} volumeDragging
+ * @property {Track|null} [contextTarget]
+ * @property {number} [contextIndex]
+ * @property {{time: number, text: string}[]} lyrics
+ * @property {boolean} lyricsVisible
+ * @property {string} quality
+ * @property {boolean} mvMode
+ * @property {boolean} loading — track is loading (blocks rapid switching)
+ * @property {number} _loadVersion — monotonic counter to detect stale callbacks
+ */
+
+/** @type {PlayerState} */
 const state = {
   playlist: [],
   currentIndex: -1,
   isPlaying: false,
   shuffle: false,
-  repeat: 'none', // 'none' | 'all' | 'one'
+  repeat: 'none',
   volume: 0.8,
   muted: false,
   seeking: false,
   volumeDragging: false,
   contextTarget: null,
+  contextIndex: -1,
   lyrics: [],
   lyricsVisible: false,
-  quality: 'standard', // 'standard' | 'exhigh' | 'SQ' | 'lossless' | 'hires'
+  quality: 'standard',
   mvMode: false,
+  loading: false,
+  _loadVersion: 0,
 };
 
-// Quality mappings
-const QUALITY_BR = { standard: 128000, exhigh: 320000, SQ: 999000, lossless: 999000, hires: 999000 };
-const QUALITY_KUWO_SIZE = { standard: '128kmp3', exhigh: '320kmp3', SQ: '2000kflac', lossless: '2000kflac', hires: 'hires' };
-const QUALITY_LABEL = { standard: '标准', exhigh: '极高', SQ: '超品', lossless: '无损', hires: 'Hi-Res' };
+/* ===== Audio ===== */
 
-// ===== Audio =====
 const audio = $('audioPlayer');
-audio.crossOrigin = 'anonymous'; // Fix CORS for external audio sources
-let audioCtx = null, analyser = null, source = null, animFrame = null;
+audio.crossOrigin = 'anonymous';
+
+/** @type {AudioContext|null} */
+let audioCtx = null;
+/** @type {AnalyserNode|null} */
+let analyser = null;
+/** @type {MediaElementAudioSourceNode|null} */
+let source = null;
+/** @type {number} */
+let animFrame = null;
+
+/** @type {AbortController|null} — current track loading abort controller */
+let currentLoadController = null;
 
 function initAudioContext() {
   if (audioCtx) return;
@@ -40,23 +145,30 @@ function initAudioContext() {
   analyser.connect(audioCtx.destination);
 }
 
-// ===== Canvas Visualizer =====
+/* ===== Canvas Visualizer ===== */
+
 const canvas = $('visualizer');
 const ctx2d = canvas.getContext('2d');
 
 function drawVisualizer() {
   animFrame = requestAnimationFrame(drawVisualizer);
-  if (!analyser) { ctx2d.clearRect(0,0,canvas.width,canvas.height); return; }
+  if (!analyser) { ctx2d.clearRect(0, 0, canvas.width, canvas.height); return; }
 
   const buf = new Uint8Array(analyser.frequencyBinCount);
   analyser.getByteFrequencyData(buf);
 
   const w = canvas.width, h = canvas.height;
-  ctx2d.clearRect(0,0,w,h);
+  ctx2d.clearRect(0, 0, w, h);
 
   const bars = buf.length;
   const cx = w / 2, cy = h / 2;
-  const r = Math.min(w,h) * 0.37;
+  const r = Math.min(w, h) * 0.37;
+
+  // Create a single radial gradient for all bars
+  const grad = ctx2d.createRadialGradient(cx, cy, r, cx, cy, r * 1.5);
+  grad.addColorStop(0, 'rgba(124,106,247,0.7)');
+  grad.addColorStop(0.5, 'rgba(180,120,200,0.5)');
+  grad.addColorStop(1, 'rgba(233,109,176,0.3)');
 
   for (let i = 0; i < bars; i++) {
     const angle = (i / bars) * Math.PI * 2 - Math.PI / 2;
@@ -66,14 +178,11 @@ function drawVisualizer() {
     const x2 = cx + Math.cos(angle) * (r + amp);
     const y2 = cy + Math.sin(angle) * (r + amp);
 
-    const grad = ctx2d.createLinearGradient(x1,y1,x2,y2);
-    grad.addColorStop(0, 'rgba(124,106,247,0.6)');
-    grad.addColorStop(1, 'rgba(233,109,176,0.3)');
     ctx2d.strokeStyle = grad;
     ctx2d.lineWidth = 2;
     ctx2d.beginPath();
-    ctx2d.moveTo(x1,y1);
-    ctx2d.lineTo(x2,y2);
+    ctx2d.moveTo(x1, y1);
+    ctx2d.lineTo(x2, y2);
     ctx2d.stroke();
   }
 }
@@ -84,9 +193,16 @@ function resizeCanvas() {
   canvas.height = c.offsetHeight * 1.3;
 }
 
-// ===== Playlist Management =====
+/* ===== Playlist Management ===== */
+
+/**
+ * Add a track to the playlist.
+ * @param {Track} track
+ * @param {'end'|'next'} [position='end']
+ * @returns {number} index of added track, or existing index if duplicate
+ */
 function addTrack(track, position = 'end') {
-  const dup = state.playlist.findIndex(t => t.id === track.id && t.id);
+  const dup = state.playlist.findIndex(t => t.id && t.id === track.id);
   if (dup !== -1 && track.id) { toast('已在列表中'); return dup; }
 
   if (position === 'end') {
@@ -102,6 +218,10 @@ function addTrack(track, position = 'end') {
   }
 }
 
+/**
+ * Remove a track by index.
+ * @param {number} index
+ */
 function removeTrack(index) {
   if (index === state.currentIndex) {
     const wasPlaying = state.isPlaying;
@@ -113,7 +233,7 @@ function removeTrack(index) {
     } else {
       state.currentIndex = Math.min(index, state.playlist.length - 1);
       loadTrack(state.currentIndex);
-      if (wasPlaying) audio.play().catch(() => {});
+      if (wasPlaying) audio.play().catch(() => { });
     }
   } else {
     state.playlist.splice(index, 1);
@@ -122,6 +242,7 @@ function removeTrack(index) {
   renderPlaylist();
 }
 
+/** Render the playlist UI from state. */
 function renderPlaylist() {
   const list = $('playlist');
   const empty = $('playlistEmpty');
@@ -133,47 +254,56 @@ function renderPlaylist() {
   }
   empty.style.display = 'none';
 
-  list.innerHTML = state.playlist.map((t, i) => {
+  const fragment = document.createDocumentFragment();
+  state.playlist.forEach((t, i) => {
     const active = i === state.currentIndex;
+    const li = document.createElement('li');
+    li.className = `playlist-item ${active ? 'active' : ''}`;
+    li.dataset.index = i;
+
     const thumb = t.cover
-      ? `<img src="${t.cover}" class="track-thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+      ? `<img src="${t.cover}" class="track-thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" alt="">`
       : '';
     const placeholder = `<div class="track-thumb-placeholder" ${t.cover ? 'style="display:none"' : ''}>
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <path d="M9 18V5l12-2v13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
         <circle cx="6" cy="18" r="3" stroke="currentColor" stroke-width="2"/>
         <circle cx="18" cy="16" r="3" stroke="currentColor" stroke-width="2"/>
       </svg>
     </div>`;
     const dur = t.duration ? fmtTime(t.duration / 1000) : '';
-    return `
-      <li class="playlist-item ${active ? 'active' : ''}" data-index="${i}">
-        <div class="track-index">${i+1}</div>
-        <div class="track-playing">
-          <div class="bar" style="height:8px"></div>
-          <div class="bar" style="height:12px"></div>
-          <div class="bar" style="height:6px"></div>
-        </div>
-        ${thumb}${placeholder}
-        <div class="track-info">
-          <div class="track-name">${esc(t.name)}</div>
-          <div class="track-artist">${esc(t.artist || '')}</div>
-        </div>
-        ${dur ? `<span class="track-duration">${dur}</span>` : ''}
-        <button class="track-remove" data-remove="${i}" title="移除">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-            <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          </svg>
-        </button>
-      </li>`;
-  }).join('');
+    li.innerHTML = `
+      <div class="track-index">${i + 1}</div>
+      <div class="track-playing">
+        <div class="bar" style="height:8px"></div>
+        <div class="bar" style="height:12px"></div>
+        <div class="bar" style="height:6px"></div>
+      </div>
+      ${thumb}${placeholder}
+      <div class="track-info">
+        <div class="track-name">${esc(t.name)}</div>
+        <div class="track-artist">${esc(t.artist || '')}</div>
+      </div>
+      ${dur ? `<span class="track-duration">${dur}</span>` : ''}
+      <button class="track-remove" data-remove="${i}" title="移除" aria-label="移除 ${esc(t.name)}">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>`;
 
-  // Scroll active item into view
+    fragment.appendChild(li);
+  });
+
+  // Replace all children at once (reduces reflow)
+  list.innerHTML = '';
+  list.appendChild(fragment);
+
   const activeEl = list.querySelector('.playlist-item.active');
   if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
 }
 
-// ===== Marquee for long titles =====
+/* ===== Marquee ===== */
+
 function applyMarquee(el) {
   el.classList.remove('text-scrolling');
   el.style.removeProperty('--scroll-dist');
@@ -186,14 +316,35 @@ function applyMarquee(el) {
   });
 }
 
-// ===== Load & Play =====
+/* ===== Track Loading (State Machine) ===== */
+
+/**
+ * Load a track by index. Uses a version counter to prevent stale callbacks
+ * and AbortController to cancel in-flight API requests.
+ * @param {number} index
+ */
 function loadTrack(index) {
   if (index < 0 || index >= state.playlist.length) return;
+
+  // Bump version to invalidate any previous loadTrack's callbacks
+  state._loadVersion++;
+  const myVersion = state._loadVersion;
+
+  // Cancel previous in-flight requests
+  if (currentLoadController) {
+    currentLoadController.abort();
+  }
+  currentLoadController = new AbortController();
+  const signal = currentLoadController.signal;
+
   const wasInMVMode = state.mvMode;
   hideMVPlayer();
+
+  state.loading = true;
   state.currentIndex = index;
   const track = state.playlist[index];
 
+  // Update UI immediately
   $('songTitle').textContent = track.name;
   $('currentSongTitle').textContent = track.name + (track.artist ? ' - ' + track.artist : '');
   $('lyricsSongTitle').textContent = track.name;
@@ -217,60 +368,34 @@ function loadTrack(index) {
     $('coverPlaceholder').classList.remove('hidden');
   }
 
-  // For online tracks, fetch URL if needed
-  if (track.type === 'online' && !track.url) {
-    if (track.source === 'kuwo') {
-      // Prevent retry loop
-      if (track._kuwoFailed) {
-        toast('该歌曲暂不可用，请尝试其他音质或其他歌曲', true);
-        return;
-      }
-      fetchKuwoDetailWithFallback(track.name, track.artist).then(({ url, cover }) => {
-        if (cover && !track.cover) {
-          track.cover = cover;
-          const img = $('coverArt');
-          img.src = cover;
-          img.onload = () => { img.classList.add('loaded'); $('coverPlaceholder').classList.add('hidden'); };
-          img.onerror = () => { img.classList.remove('loaded'); $('coverPlaceholder').classList.add('hidden'); };
-        }
-        if (url) {
-          // Try direct URL first, audio error handler will retry via proxy if needed
-          track.url = url;
-          audio.src = url;
-          // Delay auto-play 500ms to let the user see the cover
-          setTimeout(() => {
-            audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-          }, 500);
-        } else {
-          track._kuwoFailed = true;
-          toast('该歌曲暂不可用', true);
-        }
-      });
-    } else {
-      fetchSongUrl(track.id).then(url => {
-        if (url) {
-          track.url = url;
-          audio.src = url;
-          audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-        } else {
-          toast('无法获取播放链接，请检查网络', true);
-        }
-      });
-    }
-  } else if (track.url) {
-    audio.src = track.url;
-  }
-
-  if (track.type === 'online' && track.source !== 'kuwo') {
-    loadLyrics(track.id);
-  } else {
-    clearLyrics();
-  }
-
   renderPlaylist();
   document.title = `${track.name} - Music Player`;
 
-  // Auto-load MV if previous track was in video mode and new track has cache
+  // Handle track loading based on type
+  if (track.type === 'online') {
+    if (!track.url) {
+      _fetchAndPlay(track, signal, myVersion);
+    } else {
+      // Already has URL, just set it
+      _setSourceAndPlay(track, myVersion);
+    }
+
+    // Load lyrics for netease tracks
+    if (track.source === 'netease') {
+      loadLyrics(track.id);
+    } else {
+      clearLyrics();
+    }
+  } else {
+    // Local file
+    if (track.url) {
+      audio.src = track.url;
+    }
+    clearLyrics();
+    state.loading = false;
+  }
+
+  // Auto-load MV if previous track was in video mode
   if (wasInMVMode) {
     const cached = getMVCache(track.name, track.artist || '');
     if (cached && cached.videoUrl) {
@@ -279,23 +404,119 @@ function loadTrack(index) {
   }
 }
 
-function playTrack(index) {
-  loadTrack(index);
-  audio.play().then(() => setPlaying(true)).catch(() => {});
+/**
+ * Fetch play URL for a track and set the audio source.
+ * @param {Track} track
+ * @param {AbortSignal} signal
+ * @param {number} version
+ */
+async function _fetchAndPlay(track, signal, version) {
+  try {
+    if (track.source === 'kuwo') {
+      const msg = track.artist ? `${track.name} ${track.artist}` : track.name;
+      const size = QUALITY_KUWO_SIZE[state.quality] || '128kmp3';
+      const result = await getKuwoDetail(msg, 1, size);
+
+      // Check if we're still on the same track
+      if (state._loadVersion !== version || signal.aborted) return;
+
+      if (result.cover && !track.cover) {
+        track.cover = result.cover;
+        const img = $('coverArt');
+        img.src = result.cover;
+        img.onload = () => { img.classList.add('loaded'); $('coverPlaceholder').classList.add('hidden'); };
+      }
+
+      if (result.url) {
+        track.url = result.url;
+        _setSourceAndPlay(track, version);
+      } else {
+        _handlePlayError(track, version, '该歌曲暂不可用');
+      }
+    } else {
+      // NetEase source
+      const br = QUALITY_BR[state.quality] || 128000;
+      const url = await getSongUrl(track.id, br);
+
+      if (state._loadVersion !== version || signal.aborted) return;
+
+      if (url) {
+        track.url = url;
+        _setSourceAndPlay(track, version);
+      } else {
+        _handlePlayError(track, version, '无法获取播放链接');
+      }
+    }
+  } catch (err) {
+    if (err.message === 'Request cancelled') return;
+    if (state._loadVersion !== version) return;
+    _handlePlayError(track, version, `获取播放链接失败: ${err.message}`);
+  }
 }
 
+/**
+ * Set audio source and auto-play.
+ * @param {Track} track
+ * @param {number} version
+ */
+function _setSourceAndPlay(track, version) {
+  if (state._loadVersion !== version) return;
+
+  audio.src = track.url;
+  // Delay auto-play 500ms for cover animation
+  setTimeout(() => {
+    if (state._loadVersion !== version) return;
+    audio.play()
+      .then(() => setPlaying(true))
+      .catch(() => { /* autoplay blocked or source error */ });
+  }, 500);
+
+  state.loading = false;
+}
+
+/**
+ * Handle playback errors with unified strategy.
+ * @param {Track} track
+ * @param {number} version
+ * @param {string} message
+ */
+function _handlePlayError(track, version, message) {
+  if (state._loadVersion !== version) return;
+  state.loading = false;
+  toast(message, true);
+}
+
+/**
+ * Play a track by index.
+ * @param {number} index
+ */
+function playTrack(index) {
+  loadTrack(index);
+  // loadTrack will auto-play after URL fetch
+  // If it's a local track or already has URL, we need to explicitly play
+  const track = state.playlist[index];
+  if (track && (track.type !== 'online' || track.url)) {
+    setTimeout(() => audio.play().then(() => setPlaying(true)).catch(() => { }), 100);
+  }
+}
+
+/** Toggle play/pause. */
 function togglePlay() {
   if (state.playlist.length === 0) return;
   if (state.currentIndex === -1) { playTrack(0); return; }
   if (audio.paused) {
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
-    audio.play().then(() => setPlaying(true)).catch(() => {});
+    audio.play().then(() => setPlaying(true)).catch(() => { });
   } else {
     audio.pause();
     setPlaying(false);
   }
 }
 
+/**
+ * Set playing state and update UI.
+ * @param {boolean} val
+ */
 function setPlaying(val) {
   state.isPlaying = val;
   const playBtn = $('playBtn');
@@ -306,6 +527,7 @@ function setPlaying(val) {
   }
 }
 
+/** Reset player to idle state. */
 function resetPlayer() {
   state.isPlaying = false;
   audio.src = '';
@@ -325,18 +547,14 @@ function resetPlayer() {
   document.title = 'Music Player';
 }
 
+/** Play next track. */
 function playNext() {
   if (state.playlist.length === 0) return;
-  let next;
-  if (state.shuffle) {
-    next = Math.floor(Math.random() * state.playlist.length);
-  } else {
-    next = state.currentIndex + 1;
-    if (next >= state.playlist.length) next = 0;
-  }
+  const next = _nextIndex();
   playTrack(next);
 }
 
+/** Play previous track. */
 function playPrev() {
   if (state.playlist.length === 0) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
@@ -345,7 +563,19 @@ function playPrev() {
   playTrack(prev);
 }
 
-// ===== Audio Events =====
+/**
+ * Calculate the next track index based on shuffle/repeat mode.
+ * @returns {number}
+ */
+function _nextIndex() {
+  if (state.shuffle) return Math.floor(Math.random() * state.playlist.length);
+  let next = state.currentIndex + 1;
+  if (next >= state.playlist.length) next = 0;
+  return next;
+}
+
+/* ===== Audio Events ===== */
+
 audio.addEventListener('timeupdate', () => {
   if (state.seeking || !audio.duration) return;
   const pct = (audio.currentTime / audio.duration) * 100;
@@ -381,25 +611,21 @@ audio.addEventListener('pause', () => {
   setPlaying(false);
 });
 
-audio.addEventListener('error', (e) => {
-  const t = state.playlist[state.currentIndex];
-  // Ignore errors when audio is empty
+audio.addEventListener('error', () => {
+  const track = state.playlist[state.currentIndex];
   if (!audio.src || audio.src === window.location.href) return;
+  if (!track) return;
 
-  // If this track was already proxied, skip retry
-  if (t && t._proxied) return;
-
-  // If direct URL failed and we have a proxy, retry via proxy
-  if (t && t.url && !t._proxyAttempted) {
-    t._proxyAttempted = true;
+  // Handle proxy retry
+  if (track.url && !track._proxyAttempted) {
+    track._proxyAttempted = true;
     let proxyUrl = null;
-    if (t.source === 'netease') {
-      proxyUrl = neteaseProxyUrl(t.url);
-    } else if (t.source === 'kuwo') {
-      proxyUrl = kuwoProxyUrl(t.url);
+    if (track.source === 'netease') {
+      proxyUrl = neteaseProxyUrl(track.url);
+    } else if (track.source === 'kuwo') {
+      proxyUrl = kuwoProxyUrl(track.url);
     }
-    if (proxyUrl && t.url !== proxyUrl) {
-      // Retry with proxy
+    if (proxyUrl && track.url !== proxyUrl) {
       const wasPlaying = state.isPlaying;
       audio.src = proxyUrl;
       audio.load();
@@ -411,52 +637,39 @@ audio.addEventListener('error', (e) => {
     }
   }
 
-  if (t && t.type === 'online') {
-    // If kuwo source fails due to CORS, try to fallback to netease
-    if (t.source === 'kuwo' && !t._kuwoFailed) {
-      t._kuwoFailed = true;
-      toast('酷我音源不可用，尝试切换到网易云…', true);
-      // Search same song on netease
-      const keywords = `${t.name} ${t.artist}`;
-      fetch(`/api/search?keywords=${encodeURIComponent(keywords)}&limit=1`)
-        .then(r => r.json())
-        .then(data => {
-          const songs = data.result?.songs || [];
-          if (songs.length > 0) {
-            const s = songs[0];
-            t.id = String(s.id);
-            t.source = 'netease';
-            t.url = null;
-            t._kuwoFailed = false;
-            t._retryCount = 0;
-            t._proxyAttempted = false;
-            loadTrack(state.currentIndex);
-          } else {
-            toast('网易云也无此歌曲', true);
-            setPlaying(false);
-          }
-        })
-        .catch(() => {
-          toast('切换音源失败', true);
+  // Handle kuwo→netease fallback
+  if (track.source === 'kuwo' && !track._fallbackAttempted) {
+    track._fallbackAttempted = true;
+    toast('酷我音源不可用，尝试切换到网易云…', true);
+    const keywords = `${track.name} ${track.artist}`;
+    searchNetEase(keywords, 1)
+      .then(data => {
+        const songs = data.result?.songs || [];
+        if (songs.length > 0 && state.currentIndex >= 0 && state.playlist[state.currentIndex] === track) {
+          const s = songs[0];
+          track.id = String(s.id);
+          track.source = 'netease';
+          track.url = null;
+          track._fallbackAttempted = false;
+          loadTrack(state.currentIndex);
+        } else {
+          toast('网易云也无此歌曲', true);
           setPlaying(false);
-        });
-      return;
-    }
-    if (t._kuwoFailed) return;
-    t._retryCount = (t._retryCount || 0) + 1;
-    if (t._retryCount > 3) {
-      t._kuwoFailed = true;
-      setPlaying(false);
-      toast('播放失败，该歌曲暂不可用', true);
-      return;
-    }
-    t.url = null;
-    toast('播放失败，尝试重新获取链接…', true);
-    loadTrack(state.currentIndex);
+        }
+      })
+      .catch(() => {
+        toast('切换音源失败', true);
+        setPlaying(false);
+      });
+    return;
   }
+
+  setPlaying(false);
+  toast('播放失败，该歌曲暂不可用', true);
 });
 
-// ===== Progress Bar Drag =====
+/* ===== Progress Bar Drag ===== */
+
 function setupProgressDrag() {
   const container = $('progressContainer');
 
@@ -486,7 +699,8 @@ function setupProgressDrag() {
   container.addEventListener('touchend', () => { state.seeking = false; });
 }
 
-// ===== Volume Drag =====
+/* ===== Volume Drag ===== */
+
 function setupVolumeDrag() {
   const container = $('volumeContainer');
 
@@ -510,6 +724,10 @@ function setupVolumeDrag() {
   container.addEventListener('touchmove', e => setFromEvent(e), { passive: true });
 }
 
+/**
+ * Set volume level.
+ * @param {number} val 0-1
+ */
 function setVolume(val) {
   state.volume = val;
   state.muted = false;
@@ -521,8 +739,10 @@ function setVolume(val) {
   $('volumeValue').textContent = Math.round(val * 100);
   $('muteBtn').querySelector('.icon-volume').classList.remove('hidden');
   $('muteBtn').querySelector('.icon-mute').classList.add('hidden');
+  saveVolume(val);
 }
 
+/** Toggle mute. */
 function toggleMute() {
   state.muted = !state.muted;
   audio.muted = state.muted;
@@ -530,11 +750,13 @@ function toggleMute() {
   $('muteBtn').querySelector('.icon-mute').classList.toggle('hidden', !state.muted);
 }
 
-// ===== Shuffle & Repeat =====
+/* ===== Shuffle & Repeat ===== */
+
 function toggleShuffle() {
   state.shuffle = !state.shuffle;
   $('shuffleBtn').classList.toggle('active', state.shuffle);
   toast(state.shuffle ? '随机播放 开' : '随机播放 关');
+  saveShuffle(state.shuffle);
 }
 
 function toggleRepeat() {
@@ -547,20 +769,39 @@ function toggleRepeat() {
   btn.querySelector('.icon-repeat-one').classList.toggle('hidden', state.repeat !== 'one');
   const labels = { none: '不循环', all: '列表循环', one: '单曲循环' };
   toast(labels[state.repeat]);
+  saveRepeat(state.repeat);
 }
 
-// ===== Online Search =====
+/* ===== Online Search (with debounce) ===== */
+
+/** @type {number} — debounce timer ID */
+let _searchDebounceTimer = 0;
+
+/**
+ * Debounced search trigger.
+ * @param {string} keywords
+ */
+function triggerSearch(keywords) {
+  clearTimeout(_searchDebounceTimer);
+  _searchDebounceTimer = setTimeout(() => searchSongs(keywords), 400);
+}
+
+/**
+ * Search songs from both APIs concurrently.
+ * @param {string} keywords
+ * @param {number} [offset=0]
+ */
 async function searchSongs(keywords, offset = 0) {
+  // Cancel any in-flight search requests
+  cancelRequests('search:');
+
   const results = $('searchResults');
   if (offset === 0) results.innerHTML = '<p class="loading-text searching">搜索中…</p>';
 
   try {
-    // Call both APIs concurrently; kuwo only on first page
     const [neteaseResult, kuwoResult] = await Promise.allSettled([
-      fetch(`/api/search?keywords=${encodeURIComponent(keywords)}&limit=20&offset=${offset}`).then(r => r.json()),
-      offset === 0
-        ? fetch(`/api/search/kuwo?keywords=${encodeURIComponent(keywords)}`).then(r => r.json())
-        : Promise.resolve(null)
+      searchNetEase(keywords, 20, offset),
+      offset === 0 ? searchKuwo(keywords) : Promise.resolve(null),
     ]);
 
     const neteaseSongs = neteaseResult.status === 'fulfilled' ? (neteaseResult.value?.result?.songs || []) : [];
@@ -573,13 +814,12 @@ async function searchSongs(keywords, offset = 0) {
     if (neteaseSongs.length > 0) {
       try {
         const songIds = neteaseSongs.map(s => s.id).join(',');
-        const detailRes = await fetch(`/api/song/detail?ids=${songIds}`);
-        const detailData = await detailRes.json();
-        (detailData.songs || []).forEach(s => {
+        const detailRes = await getSongDetail(songIds);
+        (detailRes.songs || []).forEach(s => {
           const pic = s.al?.picUrl || '';
           if (pic) coverMap[s.id] = pic;
         });
-      } catch(e) { console.warn('Failed to fetch covers:', e); }
+      } catch (e) { console.warn('Failed to fetch covers:', e); }
     }
 
     // Build netease track objects
@@ -612,7 +852,7 @@ async function searchSongs(keywords, offset = 0) {
         _dedupKey: (song.name + '|' + (song.singer || '')).toLowerCase()
       }));
 
-    // Merge: kuwo first (no IP restriction), then netease (browser can access directly)
+    // Merge: kuwo first (no IP restriction), then netease
     const merged = [...kuwoTracks, ...neteaseTracks];
 
     if (merged.length === 0 && offset === 0) {
@@ -632,8 +872,8 @@ async function searchSongs(keywords, offset = 0) {
           <div class="result-name">${esc(track.name)} ${sourceTag}</div>
           <div class="result-meta">${esc(track.artist)}${track.album ? ' · ' + esc(track.album) : ''}</div>
         </div>
-        <button class="result-add" title="添加到列表">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <button class="result-add" title="添加到列表" aria-label="添加 ${esc(track.name)} 到列表">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
@@ -652,7 +892,8 @@ async function searchSongs(keywords, offset = 0) {
 
       item.addEventListener('contextmenu', e => {
         e.preventDefault();
-        state.contextTarget = { track, index: -1 };
+        state.contextTarget = track;
+        state.contextIndex = -1;
         showContextMenu(e.clientX, e.clientY, true);
       });
 
@@ -660,47 +901,26 @@ async function searchSongs(keywords, offset = 0) {
     });
 
   } catch (err) {
+    if (err.message === 'Request cancelled') return;
     results.innerHTML = '<p class="loading-text">搜索失败，请确认服务已启动</p>';
   }
 }
 
-async function fetchSongUrl(id) {
-  try {
-    const br = QUALITY_BR[state.quality] || 128000;
-    const res = await fetch(`/api/song/url?id=${id}&br=${br}`);
-    const data = await res.json();
-    const item = (data.data || [])[0];
-    return item?.url || null;
-  } catch { return null; }
-}
-
-function kuwoProxyUrl(url) {
-  if (!url) return url;
-  return `/api/kuwo/audio?url=${encodeURIComponent(url)}`;
-}
-
-function neteaseProxyUrl(url) {
-  if (!url) return url;
-  return `/api/netease/audio?url=${encodeURIComponent(url)}`;
-}
-
-async function fetchKuwoDetail(name, artist, quality = state.quality) {
-  try {
-    const msg = artist ? `${name} ${artist}` : name;
-    const size = QUALITY_KUWO_SIZE[quality] || '128kmp3';
-    const res = await fetch(`/api/kuwo/detail?msg=${encodeURIComponent(msg)}&n=1&size=${encodeURIComponent(size)}`);
-    const data = await res.json();
-    return { url: data.url || null, cover: data.picture || '' };
-  } catch { return { url: null, cover: '' }; }
-}
-
+/**
+ * Fetch Kuwo detail with quality fallback.
+ * @param {string} name
+ * @param {string} artist
+ * @returns {Promise<{url: string|null, cover: string}>}
+ */
 async function fetchKuwoDetailWithFallback(name, artist) {
   const QUALITY_ORDER = ['hires', 'lossless', 'SQ', 'exhigh', 'standard'];
   const startIdx = QUALITY_ORDER.indexOf(state.quality);
   const qualitiesToTry = QUALITY_ORDER.slice(startIdx >= 0 ? startIdx : 0);
 
   for (const quality of qualitiesToTry) {
-    const result = await fetchKuwoDetail(name, artist, quality);
+    const size = QUALITY_KUWO_SIZE[quality] || '128kmp3';
+    const msg = artist ? `${name} ${artist}` : name;
+    const result = await getKuwoDetail(msg, 1, size);
     if (result.url) {
       if (quality !== state.quality) {
         toast(`${QUALITY_LABEL[state.quality]} 不可用，已降级至 ${QUALITY_LABEL[quality]}`);
@@ -711,36 +931,38 @@ async function fetchKuwoDetailWithFallback(name, artist) {
   return { url: null, cover: '' };
 }
 
+/**
+ * Fetch Kuwo play URL with netease fallback.
+ * @param {string} name
+ * @param {string} artist
+ * @returns {Promise<string|null>}
+ */
 async function fetchKuwoPlayUrl(name, artist) {
-  try {
-    const keywords = artist ? `${name} ${artist}` : name;
-    const size = QUALITY_KUWO_SIZE[state.quality] || '128kmp3';
-    const res = await fetch(`/api/song/url/kuwo?keywords=${encodeURIComponent(keywords)}&size=${encodeURIComponent(size)}`);
-    const data = await res.json();
-    if (data.url) return data.url;
-    // Fallback to netease
-    const searchRes = await fetch(`/api/search?keywords=${encodeURIComponent(keywords)}&limit=5`);
-    const searchData = await searchRes.json();
-    const songs = searchData.result?.songs || [];
-    if (songs.length === 0) return null;
-    return await fetchSongUrl(String(songs[0].id));
-  } catch { return null; }
+  const keywords = artist ? `${name} ${artist}` : name;
+  const size = QUALITY_KUWO_SIZE[state.quality] || '128kmp3';
+  return getKuwoPlayUrl(keywords, size);
 }
 
+/** Load and display hot searches. */
 async function loadHotSearches() {
   try {
-    const res = await fetch('/api/search/hot');
-    const data = await res.json();
-    const list = data.data || [];
+    const list = await getHotSearches();
     const container = $('hotTags');
     if (list.length === 0) { $('hotSearches').style.display = 'none'; return; }
     container.innerHTML = list.slice(0, 10).map(item =>
-      `<span class="hot-tag">${esc(item.searchWord || item.first || '')}</span>`
+      `<span class="hot-tag" role="button" tabindex="0" aria-label="搜索 ${esc(item.searchWord || item.first || '')}">${esc(item.searchWord || item.first || '')}</span>`
     ).join('');
     container.querySelectorAll('.hot-tag').forEach(tag => {
       tag.addEventListener('click', () => {
         $('searchInput').value = tag.textContent;
         searchSongs(tag.textContent);
+      });
+      tag.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          $('searchInput').value = tag.textContent;
+          searchSongs(tag.textContent);
+        }
       });
     });
   } catch {
@@ -748,12 +970,16 @@ async function loadHotSearches() {
   }
 }
 
-// ===== Lyrics =====
+/* ===== Lyrics ===== */
+
+/**
+ * Load and render lyrics for a song.
+ * @param {string|number} id
+ */
 async function loadLyrics(id) {
   clearLyrics();
   try {
-    const res = await fetch(`/api/lyric?id=${id}`);
-    const data = await res.json();
+    const data = await getLyric(id);
     const lrc = data.lrc?.lyric || '';
     state.lyrics = parseLrc(lrc);
     if (state.lyrics.length > 0) renderLyrics();
@@ -763,26 +989,37 @@ async function loadLyrics(id) {
   }
 }
 
+/**
+ * Parse LRC format lyrics.
+ * @param {string} lrc
+ * @returns {{time: number, text: string}[]}
+ */
 function parseLrc(lrc) {
   const lines = [];
   const re = /\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)/g;
   let m;
   while ((m = re.exec(lrc)) !== null) {
-    const time = parseInt(m[1]) * 60 + parseInt(m[2]) + parseInt(m[3].padEnd(3,'0')) / 1000;
+    const time = parseInt(m[1]) * 60 + parseInt(m[2]) + parseInt(m[3].padEnd(3, '0')) / 1000;
     const text = m[4].trim();
     if (text) lines.push({ time, text });
   }
-  return lines.sort((a,b) => a.time - b.time);
+  return lines.sort((a, b) => a.time - b.time);
 }
 
 function renderLyrics() {
   $('lyricsContent').innerHTML = state.lyrics.map((l, i) =>
-    `<div class="lyric-line" data-index="${i}" data-time="${l.time}">${esc(l.text)}</div>`
+    `<div class="lyric-line" data-index="${i}" data-time="${l.time}" role="button" tabindex="0" aria-label="跳转到 ${fmtTime(l.time)}">${esc(l.text)}</div>`
   ).join('');
 
   $('lyricsContent').querySelectorAll('.lyric-line').forEach(el => {
     el.addEventListener('click', () => {
       audio.currentTime = parseFloat(el.dataset.time);
+    });
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        audio.currentTime = parseFloat(el.dataset.time);
+      }
     });
   });
 }
@@ -794,6 +1031,11 @@ function clearLyrics() {
 }
 
 let lastLyricIndex = -1;
+
+/**
+ * Update active lyric line based on current playback time.
+ * @param {number} time
+ */
 function updateActiveLyric(time) {
   if (state.lyrics.length === 0) return;
   let idx = state.lyrics.findLastIndex(l => l.time <= time);
@@ -806,7 +1048,7 @@ function updateActiveLyric(time) {
     lines[idx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
-  // Update inline lyric below cover (two lines: current + next)
+  // Update inline lyric below cover
   const lyricEl = $('currentLyric');
   if (idx >= 0 && state.lyrics[idx]) {
     const curText = state.lyrics[idx].text;
@@ -819,7 +1061,12 @@ function updateActiveLyric(time) {
   }
 }
 
-// ===== Local Files =====
+/* ===== Local Files ===== */
+
+/**
+ * Handle uploaded audio files.
+ * @param {FileList} files
+ */
 function handleFiles(files) {
   const audioFiles = Array.from(files).filter(f => f.type.startsWith('audio/') || /\.(mp3|flac|ogg|aac|wav|m4a|opus)$/i.test(f.name));
   if (audioFiles.length === 0) { toast('没有找到支持的音频文件', true); return; }
@@ -835,7 +1082,14 @@ function handleFiles(files) {
   showPanel('playlist');
 }
 
-// ===== Context Menu =====
+/* ===== Context Menu ===== */
+
+/**
+ * Show context menu.
+ * @param {number} x
+ * @param {number} y
+ * @param {boolean} [isSearch=false]
+ */
 function showContextMenu(x, y, isSearch = false) {
   const menu = $('contextMenu');
   $('ctxRemove').style.display = isSearch ? 'none' : 'flex';
@@ -847,7 +1101,8 @@ function showContextMenu(x, y, isSearch = false) {
 
 function hideContextMenu() { $('contextMenu').classList.add('hidden'); }
 
-// ===== Sidebar & Panels =====
+/* ===== Sidebar & Panels ===== */
+
 function toggleSidebar() {
   const sb = $('sidebar');
   const backdrop = $('sidebarBackdrop');
@@ -877,14 +1132,15 @@ function showPanel(name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
   $(`panel-${name}`).classList.add('active');
-  document.querySelector(`.nav-item[data-panel="${name}"]`).classList.add('active');
-  // Sync bottom nav active state
+  const navBtn = document.querySelector(`.nav-item[data-panel="${name}"]`);
+  if (navBtn) navBtn.classList.add('active');
   document.querySelectorAll('.bottom-nav-item').forEach(b => {
     b.classList.toggle('active', b.dataset.panel === name);
   });
 }
 
-// ===== Touch Gestures =====
+/* ===== Touch Gestures ===== */
+
 function setupTouchGestures() {
   let touchStartX = 0, touchStartY = 0, touchStartTime = 0;
   const area = document.querySelector('.main-content');
@@ -899,9 +1155,7 @@ function setupTouchGestures() {
     const dx = e.changedTouches[0].clientX - touchStartX;
     const dy = e.changedTouches[0].clientY - touchStartY;
     const dt = Date.now() - touchStartTime;
-    // Horizontal swipe only: fast, dominant horizontal direction
     if (dt < 500 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-      // If swipe started on cover container, let coverSwipe handle it
       if (e.target.closest('#coverContainer')) return;
       if (dx < 0) playNext();
       else playPrev();
@@ -909,7 +1163,8 @@ function setupTouchGestures() {
   }, { passive: true });
 }
 
-// ===== Long Press on Cover =====
+/* ===== Long Press on Cover ===== */
+
 function setupCoverLongPress() {
   let longPressTimer = null;
   const cover = $('coverContainer');
@@ -919,7 +1174,8 @@ function setupCoverLongPress() {
       longPressTimer = null;
       const track = state.playlist[state.currentIndex];
       if (!track) return;
-      state.contextTarget = { track, index: state.currentIndex };
+      state.contextTarget = track;
+      state.contextIndex = state.currentIndex;
       const rect = cover.getBoundingClientRect();
       showContextMenu(rect.left + rect.width / 2 - 80, rect.bottom - 20, false);
     }, 600);
@@ -929,27 +1185,12 @@ function setupCoverLongPress() {
   cover.addEventListener('touchmove', () => { clearTimeout(longPressTimer); }, { passive: true });
 }
 
-// ===== Helpers =====
-function fmtTime(s) {
-  if (!isFinite(s) || s < 0) return '0:00';
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2,'0')}`;
-}
+/* ===== Quality ===== */
 
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function toast(msg, isError = false) {
-  const t = document.createElement('div');
-  t.className = 'toast' + (isError ? ' error' : '');
-  t.textContent = msg;
-  $('toastContainer').appendChild(t);
-  setTimeout(() => t.remove(), 3000);
-}
-
-// ===== Quality =====
+/**
+ * Set audio quality and reload current track.
+ * @param {string} quality
+ */
 function setQuality(quality) {
   state.quality = quality;
   $('qualityLabel').textContent = QUALITY_LABEL[quality] || quality;
@@ -957,32 +1198,35 @@ function setQuality(quality) {
     btn.classList.toggle('active', btn.dataset.quality === quality);
   });
   $('qualityDropdown').classList.add('hidden');
+  saveQuality(quality);
 
-  // Reload current track URL if it's an online track
   const track = state.playlist[state.currentIndex];
   if (track && track.type === 'online') {
-    const wasPlaying = state.isPlaying;
+    // Cancel current load and reload with new quality
+    state._loadVersion++;
+    if (currentLoadController) currentLoadController.abort();
     const currentTime = audio.currentTime;
-    track.url = null; // Force re-fetch
-    track._proxyAttempted = false; // Reset proxy flag for retry
+    track.url = null;
+    track._proxyAttempted = false;
+
     if (track.source === 'kuwo') {
       fetchKuwoPlayUrl(track.name, track.artist).then(url => {
         if (url) {
           track.url = url;
-          audio.src = track.url;
+          audio.src = url;
           audio.currentTime = currentTime;
-          if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          if (state.isPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
           toast('该音质暂不可用', true);
         }
       });
     } else {
-      fetchSongUrl(track.id).then(url => {
+      getSongUrl(track.id, QUALITY_BR[quality] || 128000).then(url => {
         if (url) {
           track.url = url;
           audio.src = url;
           audio.currentTime = currentTime;
-          if (wasPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          if (state.isPlaying) audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         } else {
           toast('该音质暂不可用', true);
         }
@@ -993,53 +1237,41 @@ function setQuality(quality) {
   toast(`音质: ${QUALITY_LABEL[quality]}`);
 }
 
-// ===== Bilibili MV =====
+/* ===== Bilibili MV ===== */
+
+/**
+ * Clean song name for MV search (remove brackets, feat, etc.).
+ * @param {string} name
+ * @returns {string}
+ */
 function cleanSongName(name) {
   return name
-    // 去掉各种括号及其内容: (xxx)、[xxx]、{xxx}、（xxx）、【xxx】
     .replace(/[\(\[\{（【].*?[\)\]\}）】]/g, '')
-    // 去掉 feat./ft./featuring 及后面的内容（不区分大小写）
     .replace(/\s+(feat\.?|ft\.?|featuring)\s+.+$/i, '')
-    // 去掉 with 及后面的内容（常用于合作）
     .replace(/\s+with\s+.+$/i, '')
-    // 去掉 & 及后面的内容（常用于合作艺人）
     .replace(/\s+&\s+.+$/i, '')
-    // 去掉多余空格
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+/**
+ * Fetch Bilibili MV for a song.
+ * @param {string} name
+ * @param {string} artist
+ * @returns {Promise<{video_url: string, accept: string[], title: string, bvid: string}>}
+ */
 async function fetchBiliMV(name, artist) {
-  // 清理歌曲名，去掉括号、feat等干扰信息
   const cleanName = cleanSongName(name).slice(0, 30);
   const cleanArtist = artist ? artist.replace(/[\(\[\{（【].*?[\)\]\}）】]/g, '').trim() : '';
-
-  // 构建搜索词：清理后的歌曲名 + 清理后的歌手 + MV
   const query = cleanArtist
     ? encodeURIComponent(`${cleanName} ${cleanArtist} MV`)
     : encodeURIComponent(`${cleanName} MV`);
 
-  const res = await fetch(`/api/bilibili?msg=${query}&n=1`);
-  const json = await res.json();
-  if (json.code !== 200) throw new Error(json.msg || '搜索失败');
-  const data = json.data || {};
-  const url = data.url || '';
-  const bvid = data.bvid || (url.match(/BV[\w]+/) || [])[0];
-  if (!bvid) throw new Error('未找到视频BV号');
-
-  const mir6Res = await fetch(`/api/bilibili/mir6?bvid=${bvid}`);
-  const mir6Json = await mir6Res.json();
-  if (mir6Json.code !== 200) throw new Error(mir6Json.message || '视频解析失败');
-
-  return {
-    video_url: mir6Json.video_url,
-    accept: mir6Json.accept || [],
-    title: data.title || name,
-    bvid
-  };
+  return searchBiliMV(query);
 }
 
-// ===== MV Cache (localStorage) =====
+/* ===== MV Cache ===== */
+
 function mvCacheKey(name, artist) {
   return `mv_cache:${name}||${artist || ''}`;
 }
@@ -1060,7 +1292,7 @@ function setMVCache(name, artist, data) {
       title: data.title || name,
       lastPosition: 0
     }));
-  } catch {}
+  } catch { }
 }
 
 function saveMVPosition(name, artist, position) {
@@ -1071,10 +1303,11 @@ function saveMVPosition(name, artist, position) {
     const cached = JSON.parse(raw);
     cached.lastPosition = position;
     localStorage.setItem(key, JSON.stringify(cached));
-  } catch {}
+  } catch { }
 }
 
-// ===== Inline MV Panel =====
+/* ===== Inline MV Panel ===== */
+
 function showInlineMV(videoUrl, accept, title, lastPosition) {
   const panel = $('mvFullPanel');
   const inner = $('mvFullInner');
@@ -1099,7 +1332,6 @@ function showInlineMV(videoUrl, accept, title, lastPosition) {
     vid.addEventListener('loadedmetadata', () => { vid.currentTime = lastPosition; }, { once: true });
   }
 
-  // Pause audio while MV plays
   audio.pause();
   setPlaying(false);
 
@@ -1107,33 +1339,27 @@ function showInlineMV(videoUrl, accept, title, lastPosition) {
   document.querySelector('.player-area').classList.add('mv-mode');
   state.mvMode = true;
 
-  // Click outside video to close (on panel background)
   panel.addEventListener('click', (e) => {
-    if (e.target === panel || e.target === inner) {
-      hideInlineMV();
-    }
+    if (e.target === panel || e.target === inner) hideInlineMV();
   });
 
-  // Quality switching
   inner.querySelectorAll('.mv-quality-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const switchUrl = btn.dataset.url;
-      if (switchUrl) { vid.src = switchUrl; vid.play().catch(() => {}); }
+      if (switchUrl) { vid.src = switchUrl; vid.play().catch(() => { }); }
       inner.querySelectorAll('.mv-quality-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
     });
   });
 
-  // Auto-play next when MV ends
   vid.addEventListener('ended', () => { playNextMV(); });
 
-  // Handle autoplay restriction (common in Chrome/Safari for programmatic plays)
   vid.play().catch(() => {
     const overlay = document.createElement('div');
     overlay.className = 'mv-autoplay-overlay';
     overlay.innerHTML = '<button class="mv-autoplay-btn">&#9654; 点击继续播放</button>';
     overlay.addEventListener('click', () => {
-      vid.play().catch(() => {});
+      vid.play().catch(() => { });
       overlay.remove();
     });
     inner.appendChild(overlay);
@@ -1144,11 +1370,8 @@ function hideInlineMV() {
   if (!state.mvMode) return;
   const vid = $('inlineMVVideo');
   if (vid) {
-    // Save playback position to cache
     const track = state.playlist[state.currentIndex];
-    if (track && vid.currentTime > 0) {
-      saveMVPosition(track.name, track.artist || '', vid.currentTime);
-    }
+    if (track && vid.currentTime > 0) saveMVPosition(track.name, track.artist || '', vid.currentTime);
     vid.pause();
     vid.src = '';
   }
@@ -1158,7 +1381,6 @@ function hideInlineMV() {
   state.mvMode = false;
 }
 
-// Keep hideMVPlayer as alias for backward compat (called in loadTrack)
 function hideMVPlayer() { hideInlineMV(); }
 
 async function openMVPanel() {
@@ -1175,7 +1397,6 @@ async function openMVPanel() {
   audio.pause();
   setPlaying(false);
 
-  // Check cache first
   const cached = getMVCache(track.name, track.artist || '');
   if (cached && cached.videoUrl) {
     showInlineMV(cached.videoUrl, cached.accept, cached.title, cached.lastPosition || 0);
@@ -1191,61 +1412,53 @@ async function openMVPanel() {
   }
 }
 
-// Auto-play next track's MV when current MV ends
+/**
+ * Play next track with MV. Reuses playNext for index calculation,
+ * then opens MV if available, falls back to audio.
+ */
 async function playNextMV() {
   if (state.playlist.length === 0) return;
 
-  // Repeat one: replay current MV from beginning
   if (state.repeat === 'one') {
     const vid = $('inlineMVVideo');
-    if (vid) { vid.currentTime = 0; vid.play().catch(() => {}); }
+    if (vid) { vid.currentTime = 0; vid.play().catch(() => { }); }
     return;
   }
 
-  // No repeat + single track: stop
   if (state.repeat !== 'all' && state.playlist.length <= 1) {
     hideInlineMV();
     setPlaying(false);
     return;
   }
 
-  let next;
-  if (state.shuffle) {
-    next = Math.floor(Math.random() * state.playlist.length);
-  } else {
-    next = state.currentIndex + 1;
-    if (next >= state.playlist.length) next = 0;
-  }
+  const next = _nextIndex();
 
-  // Set mvMode false so loadTrack's wasInMVMode logic doesn't conflict
+  // Set mvMode false so loadTrack's wasInMVMode logic works
   state.mvMode = false;
   loadTrack(next);
 
   const track = state.playlist[next];
   if (!track) return;
 
-  // Check cache first
   const cached = getMVCache(track.name, track.artist || '');
   if (cached && cached.videoUrl) {
     showInlineMV(cached.videoUrl, cached.accept, cached.title, cached.lastPosition || 0);
     return;
   }
 
-  // Try to fetch MV; fall back to audio if unavailable
   try {
     const result = await fetchBiliMV(track.name, track.artist || '');
     setMVCache(track.name, track.artist || '', result);
     showInlineMV(result.video_url, result.accept, result.title || `${track.name} MV`, 0);
-  } catch (e) {
-    // No MV found - play audio normally
-    audio.play().then(() => setPlaying(true)).catch(() => {});
+  } catch {
+    audio.play().then(() => setPlaying(true)).catch(() => { });
   }
 }
 
-// Legacy alias used elsewhere
 function handleCoverClick() { openMVPanel(); }
 
-// ===== Cover Swipe (right-swipe = open MV) =====
+/* ===== Cover Swipe ===== */
+
 function setupCoverSwipe() {
   const cover = $('coverContainer');
   let startX = 0, startY = 0, startTime = 0;
@@ -1260,7 +1473,6 @@ function setupCoverSwipe() {
     const dx = e.changedTouches[0].clientX - startX;
     const dy = e.changedTouches[0].clientY - startY;
     const dt = Date.now() - startTime;
-    // Right-swipe on cover: open MV
     if (dt < 500 && dx > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
       if (!state.mvMode) openMVPanel();
       else hideInlineMV();
@@ -1268,9 +1480,15 @@ function setupCoverSwipe() {
   }, { passive: true });
 }
 
-// ===== Playlist Import =====
-let playlistTracks = []; // holds tracks from last loaded playlist
+/* ===== Playlist Import ===== */
 
+/** @type {Track[]} */
+let playlistTracks = [];
+
+/**
+ * Load a NetEase playlist by ID.
+ * @param {string} playlistId
+ */
 async function loadPlaylist(playlistId) {
   const panel = $('playlistPanel');
   const infoCard = $('playlistInfoCard');
@@ -1282,13 +1500,10 @@ async function loadPlaylist(playlistId) {
   playlistTracks = [];
 
   try {
-    // Fetch playlist detail and tracks in parallel
-    const [detailRes, tracksRes] = await Promise.all([
-      fetch(`/api/playlist/detail?id=${encodeURIComponent(playlistId)}`),
-      fetch(`/api/playlist/track/all?id=${encodeURIComponent(playlistId)}&limit=200`)
+    const [detailData, tracksData] = await Promise.all([
+      getPlaylistDetail(playlistId),
+      getPlaylistTracks(playlistId, 200),
     ]);
-    const detailData = await detailRes.json();
-    const tracksData = await tracksRes.json();
 
     if (detailData.code !== 200) {
       infoCard.innerHTML = `<p class="loading-text">歌单加载失败: ${esc(detailData.message || String(detailData.code))}</p>`;
@@ -1314,7 +1529,6 @@ async function loadPlaylist(playlistId) {
 
     $('plAddAllBtn').addEventListener('click', () => addPlaylistToQueue());
 
-    // Build track objects
     const songs = tracksData.songs || [];
     playlistTracks = songs.map(song => {
       const artists = (song.ar || song.artists || []).map(a => a.name).join(' / ');
@@ -1347,8 +1561,8 @@ async function loadPlaylist(playlistId) {
           <div class="result-name">${esc(track.name)}</div>
           <div class="result-meta">${esc(track.artist)}${track.album ? ' · ' + esc(track.album) : ''}</div>
         </div>
-        <button class="result-add" title="添加到列表">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <button class="result-add" title="添加到列表" aria-label="添加 ${esc(track.name)} 到列表">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
@@ -1369,7 +1583,7 @@ async function loadPlaylist(playlistId) {
     });
 
   } catch (err) {
-    infoCard.innerHTML = `<p class="loading-text">加载失败，请检查服务是否启动</p>`;
+    infoCard.innerHTML = '<p class="loading-text">加载失败，请检查服务是否启动</p>';
     console.error('loadPlaylist error:', err);
   }
 }
@@ -1381,9 +1595,33 @@ function addPlaylistToQueue() {
   showPanel('playlist');
 }
 
-// ===== Event Bindings =====
+/* ===== Event Bindings ===== */
+
 function init() {
-  // Volume init
+  // Restore persisted settings
+  const settings = loadSettings();
+  if (typeof settings.volume === 'number') {
+    state.volume = settings.volume;
+  }
+  if (typeof settings.shuffle === 'boolean') {
+    state.shuffle = settings.shuffle;
+    $('shuffleBtn').classList.toggle('active', state.shuffle);
+  }
+  if (settings.repeat) {
+    state.repeat = settings.repeat;
+    const btn = $('repeatBtn');
+    btn.classList.toggle('active', state.repeat !== 'none');
+    btn.querySelector('.icon-repeat').classList.toggle('hidden', state.repeat === 'one');
+    btn.querySelector('.icon-repeat-one').classList.toggle('hidden', state.repeat !== 'one');
+  }
+  if (settings.quality && QUALITY_LABEL[settings.quality]) {
+    state.quality = settings.quality;
+    $('qualityLabel').textContent = QUALITY_LABEL[settings.quality];
+    document.querySelectorAll('.quality-option').forEach(b => {
+      b.classList.toggle('active', b.dataset.quality === settings.quality);
+    });
+  }
+
   audio.volume = state.volume;
   $('volumeFill').style.width = (state.volume * 100) + '%';
   $('volumeThumb').style.left = (state.volume * 100) + '%';
@@ -1412,14 +1650,12 @@ function init() {
     $('sidebarBackdrop').classList.remove('active');
     if (window.innerWidth > 767) $('sidebar').classList.toggle('collapsed');
   });
-
-  // Backdrop closes sidebar on mobile
   $('sidebarBackdrop').addEventListener('click', () => {
     $('sidebar').classList.remove('open');
     $('sidebarBackdrop').classList.remove('active');
   });
 
-  // Nav tabs (sidebar internal)
+  // Nav tabs
   document.querySelectorAll('.nav-item').forEach(btn => {
     btn.addEventListener('click', () => showPanel(btn.dataset.panel));
   });
@@ -1429,10 +1665,22 @@ function init() {
     btn.addEventListener('click', () => openSidebarPanel(btn.dataset.panel));
   });
 
-  // Search
+  // Search with debounce
   const searchInput = $('searchInput');
-  $('searchBtn').addEventListener('click', () => { if (searchInput.value.trim()) searchSongs(searchInput.value.trim()); });
-  searchInput.addEventListener('keydown', e => { if (e.key === 'Enter' && searchInput.value.trim()) searchSongs(searchInput.value.trim()); });
+  $('searchBtn').addEventListener('click', () => {
+    const val = searchInput.value.trim();
+    if (val) searchSongs(val); // Immediate on button click
+  });
+  searchInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      const val = searchInput.value.trim();
+      if (val) searchSongs(val);
+    }
+  });
+  searchInput.addEventListener('input', () => {
+    const val = searchInput.value.trim();
+    if (val) triggerSearch(val); // Debounced on typing
+  });
 
   // Playlist import
   const playlistInput = $('playlistInput');
@@ -1475,28 +1723,29 @@ function init() {
     if (!item) return;
     e.preventDefault();
     const idx = parseInt(item.dataset.index);
-    state.contextTarget = { track: state.playlist[idx], index: idx };
+    state.contextTarget = state.playlist[idx];
+    state.contextIndex = idx;
     showContextMenu(e.clientX, e.clientY, false);
   });
 
   // Context menu actions
   $('ctxPlay').addEventListener('click', () => {
-    if (state.contextTarget.index >= 0) playTrack(state.contextTarget.index);
-    else { const idx = addTrack(state.contextTarget.track); playTrack(idx); showPanel('playlist'); }
+    if (state.contextIndex >= 0) playTrack(state.contextIndex);
+    else { const idx = addTrack(state.contextTarget); playTrack(idx); showPanel('playlist'); }
     hideContextMenu();
   });
   $('ctxAddNext').addEventListener('click', () => {
-    addTrack(state.contextTarget.track, 'next');
+    addTrack(state.contextTarget, 'next');
     toast('已添加到下一首');
     hideContextMenu();
   });
   $('ctxAddEnd').addEventListener('click', () => {
-    addTrack({ ...state.contextTarget.track, id: '' }, 'end');
+    addTrack({ ...state.contextTarget, id: '' }, 'end');
     toast('已添加到列表末尾');
     hideContextMenu();
   });
   $('ctxRemove').addEventListener('click', () => {
-    if (state.contextTarget.index >= 0) removeTrack(state.contextTarget.index);
+    if (state.contextIndex >= 0) removeTrack(state.contextIndex);
     hideContextMenu();
   });
 
@@ -1524,7 +1773,7 @@ function init() {
     openMVPanel();
   });
 
-  // Cover swipe gesture
+  // Cover swipe
   setupCoverSwipe();
 
   // Lyrics
@@ -1557,7 +1806,7 @@ function init() {
     else if (e.code === 'KeyM') toggleMute();
   });
 
-  // Touch gestures (mobile)
+  // Touch gestures
   setupTouchGestures();
   setupCoverLongPress();
 
@@ -1565,10 +1814,10 @@ function init() {
   resizeCanvas();
   window.addEventListener('resize', resizeCanvas);
 
-  // Load hot searches (non-critical, may fail if server not running)
+  // Load hot searches (non-critical)
   loadHotSearches();
 
-  // Start visualizer loop
+  // Start visualizer
   drawVisualizer();
 }
 
