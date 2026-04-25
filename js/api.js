@@ -94,7 +94,10 @@ export async function apiFetch(url, options = {}) {
   const doFetch = async () => {
     const timeoutId = setTimeout(() => controller.abort(), timeout);
     try {
-      const response = await fetch(url, { signal });
+      const fetchOpts = { signal, method: options.method || 'GET' };
+      if (options.body) fetchOpts.body = options.body;
+      if (options.headers) fetchOpts.headers = { ...options.headers };
+      const response = await fetch(url, fetchOpts);
       clearTimeout(timeoutId);
 
       if (!response.ok) {
@@ -179,18 +182,73 @@ export function searchKuwo(keywords, signal) {
   });
 }
 
+import { weapi } from './netease-crypto.js';
+
 /**
  * Get song URL from NetEase.
+ * Browser-side weapi encryption: request originates from user's IP (not server).
+ * Falls back to server-side API when browser fails (e.g., CORS).
  * @param {string|number} id
  * @param {number} [br=128000]
+ * @param {string} [name=''] - Song name for server-side Kuwo fallback
+ * @param {string} [artist=''] - Artist name for server-side Kuwo fallback
  * @returns {Promise<string|null>}
  */
-export async function getSongUrl(id, br = 128000) {
-  const data = await apiFetch(`/api/song/url?id=${id}&br=${br}`, {
-    retries: 1,
-  });
-  const item = (data.data || [])[0];
-  return item?.url || null;
+export async function getSongUrl(id, br = 128000, name = '', artist = '') {
+  const levelMap = { 128000: 'standard', 320000: 'exhigh', 999000: 'lossless' };
+
+  // Primary: browser-side weapi encryption → direct call to music.163.com
+  // Request originates from user's IP (likely China), not the overseas server.
+  try {
+    const { params, encSecKey } = await weapi({
+      ids: `[${id}]`,
+      level: levelMap[br] || 'standard',
+      encodeType: 'aac',
+    });
+    const form = new URLSearchParams({ params, encSecKey }).toString();
+    const resp = await fetch('https://music.163.com/weapi/song/enhance/player/url/v1?csrf_token=', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://music.163.com/',
+      },
+      body: form,
+    });
+    const data = await resp.json();
+    const item = (data.data || [])[0];
+    if (item?.url) return item.url;
+  } catch {
+    // CORS blocked or failed → fall back to server-side
+  }
+
+  // Fallback 1: server-side API (overseas, may return null → Kuwo fallback with name+artist)
+  try {
+    const data = await apiFetch(`/api/song/url?id=${id}&br=${br}&name=${encodeURIComponent(name)}&artist=${encodeURIComponent(artist)}`, { retries: 1 });
+    const item = (data.data || [])[0];
+    if (item?.url) return item.url;
+  } catch {
+    // Server failed
+  }
+
+  // Fallback 2: browser weapi → server proxy to music.163.com
+  try {
+    const { params, encSecKey } = await weapi({
+      ids: `[${id}]`,
+      level: levelMap[br] || 'standard',
+      encodeType: 'aac',
+    });
+    const data = await apiFetch('/api/netease/weapi', {
+      method: 'POST',
+      body: JSON.stringify({ path: '/song/enhance/player/url/v1', params, encSecKey }),
+      headers: { 'Content-Type': 'application/json' },
+      retries: 1,
+    });
+    const item = (data.data || [])[0];
+    if (item?.url) return item.url;
+  } catch {
+    // All methods failed
+  }
+  return null;
 }
 
 /**

@@ -398,7 +398,7 @@ function loadTrack(index) {
   // Auto-load MV if previous track was in video mode
   if (wasInMVMode) {
     const cached = getMVCache(track.name, track.artist || '');
-    if (cached && cached.videoUrl) {
+    if (cached && cached.bvid) {
       setTimeout(() => openMVPanel(), 100);
     }
   }
@@ -436,7 +436,7 @@ async function _fetchAndPlay(track, signal, version) {
     } else {
       // NetEase source
       const br = QUALITY_BR[state.quality] || 128000;
-      const url = await getSongUrl(track.id, br);
+      const url = await getSongUrl(track.id, br, track.name, track.artist || '');
 
       if (state._loadVersion !== version || signal.aborted) return;
 
@@ -1221,7 +1221,7 @@ function setQuality(quality) {
         }
       });
     } else {
-      getSongUrl(track.id, QUALITY_BR[quality] || 128000).then(url => {
+      getSongUrl(track.id, QUALITY_BR[quality] || 128000, track.name, track.artist || '').then(url => {
         if (url) {
           track.url = url;
           audio.src = url;
@@ -1264,10 +1264,27 @@ async function fetchBiliMV(name, artist) {
   const cleanName = cleanSongName(name).slice(0, 30);
   const cleanArtist = artist ? artist.replace(/[\(\[\{（【].*?[\)\]\}）】]/g, '').trim() : '';
   const query = cleanArtist
-    ? encodeURIComponent(`${cleanName} ${cleanArtist} MV`)
-    : encodeURIComponent(`${cleanName} MV`);
+    ? `${cleanName} ${cleanArtist} MV`
+    : `${cleanName} MV`;
 
-  return searchBiliMV(query);
+  // Use server-side search (yaohud v5 → fallback Bilibili official)
+  const data = await apiFetch(`/api/bilibili?msg=${encodeURIComponent(query)}&n=1`, {
+    timeout: 20000,
+    retries: 0,
+  });
+  if (data.code !== 200) throw new Error(data.msg || '搜索MV失败');
+
+  const url = data.data?.url || '';
+  const bvid = data.data?.bvid || (url.match(/BV[\w]+/) || [])[0];
+  if (!bvid) throw new Error('未找到视频BV号');
+
+  // Skip v6 parse (unreliable), use Bilibili iframe embed directly
+  return {
+    video_url: '', // not needed for iframe
+    accept: [],
+    title: data.data?.title || query,
+    bvid,
+  };
 }
 
 /* ===== MV Cache ===== */
@@ -1308,32 +1325,63 @@ function saveMVPosition(name, artist, position) {
 
 /* ===== Inline MV Panel ===== */
 
-function showInlineMV(videoUrl, accept, title, lastPosition) {
+function showInlineMV(videoUrl, accept, title, lastPosition, bvid) {
   const panel = $('mvFullPanel');
   const inner = $('mvFullInner');
 
-  let qualityHtml = '';
-  if (Array.isArray(accept) && accept.length > 1) {
-    const btns = accept.map((q, i) => {
-      const label = typeof q === 'string' ? q : (q.description || q.name || q.quality || `画质${i + 1}`);
-      const qurl = typeof q === 'object' ? (q.url || q.video_url || '') : '';
-      return `<button class="mv-quality-btn ${i === 0 ? 'active' : ''}" data-url="${esc(qurl)}" data-index="${i}">${esc(String(label))}</button>`;
-    }).join('');
-    qualityHtml = `<div class="mv-quality-bar">${btns}</div>`;
-  }
-
-  inner.innerHTML = `
-    ${qualityHtml}
-    <video id="inlineMVVideo" src="${esc(videoUrl)}" controls playsinline></video>
-  `;
-
-  const vid = $('inlineMVVideo');
-  if (lastPosition > 0) {
-    vid.addEventListener('loadedmetadata', () => { vid.currentTime = lastPosition; }, { once: true });
-  }
-
   audio.pause();
   setPlaying(false);
+
+  // Primary: use Bilibili official iframe player (reliable, no parsing needed)
+  if (bvid) {
+    const startTime = lastPosition > 0 ? Math.floor(lastPosition) : 0;
+    inner.innerHTML = `
+      <iframe
+        id="inlineMVIframe"
+        src="https://player.bilibili.com/player.html?bvid=${esc(bvid)}&t=${startTime}&high_quality=1&danmaku=0"
+        scrolling="no"
+        frameborder="0"
+        allowfullscreen
+        sandbox="allow-top-navigation allow-same-origin allow-forms allow-scripts allow-popups"
+        style="width:100%;height:100%;border:none;border-radius:12px;"
+      ></iframe>
+    `;
+  } else if (videoUrl) {
+    // Fallback: direct video URL
+    let qualityHtml = '';
+    if (Array.isArray(accept) && accept.length > 1) {
+      const btns = accept.map((q, i) => {
+        const label = typeof q === 'string' ? q : (q.description || q.name || q.quality || `画质${i + 1}`);
+        const qurl = typeof q === 'object' ? (q.url || q.video_url || '') : '';
+        return `<button class="mv-quality-btn ${i === 0 ? 'active' : ''}" data-url="${esc(qurl)}" data-index="${i}">${esc(String(label))}</button>`;
+      }).join('');
+      qualityHtml = `<div class="mv-quality-bar">${btns}</div>`;
+    }
+    inner.innerHTML = `
+      ${qualityHtml}
+      <video id="inlineMVVideo" src="${esc(videoUrl)}" controls playsinline></video>
+    `;
+    const vid = $('inlineMVVideo');
+    if (lastPosition > 0) {
+      vid.addEventListener('loadedmetadata', () => { vid.currentTime = lastPosition; }, { once: true });
+    }
+    vid.addEventListener('ended', () => { playNextMV(); });
+    vid.play().catch(() => {
+      const overlay = document.createElement('div');
+      overlay.className = 'mv-autoplay-overlay';
+      overlay.innerHTML = '<button class="mv-autoplay-btn">&#9654; 点击继续播放</button>';
+      overlay.addEventListener('click', () => { vid.play().catch(() => { }); overlay.remove(); });
+      inner.appendChild(overlay);
+    });
+    inner.querySelectorAll('.mv-quality-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const switchUrl = btn.dataset.url;
+        if (switchUrl) { vid.src = switchUrl; vid.play().catch(() => { }); }
+        inner.querySelectorAll('.mv-quality-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+  }
 
   panel.classList.add('active');
   document.querySelector('.player-area').classList.add('mv-mode');
@@ -1342,32 +1390,14 @@ function showInlineMV(videoUrl, accept, title, lastPosition) {
   panel.addEventListener('click', (e) => {
     if (e.target === panel || e.target === inner) hideInlineMV();
   });
-
-  inner.querySelectorAll('.mv-quality-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const switchUrl = btn.dataset.url;
-      if (switchUrl) { vid.src = switchUrl; vid.play().catch(() => { }); }
-      inner.querySelectorAll('.mv-quality-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-    });
-  });
-
-  vid.addEventListener('ended', () => { playNextMV(); });
-
-  vid.play().catch(() => {
-    const overlay = document.createElement('div');
-    overlay.className = 'mv-autoplay-overlay';
-    overlay.innerHTML = '<button class="mv-autoplay-btn">&#9654; 点击继续播放</button>';
-    overlay.addEventListener('click', () => {
-      vid.play().catch(() => { });
-      overlay.remove();
-    });
-    inner.appendChild(overlay);
-  });
 }
 
 function hideInlineMV() {
   if (!state.mvMode) return;
+  // Stop iframe playback
+  const iframe = $('inlineMVIframe');
+  if (iframe) iframe.src = '';
+  // Stop video playback
   const vid = $('inlineMVVideo');
   if (vid) {
     const track = state.playlist[state.currentIndex];
@@ -1398,15 +1428,15 @@ async function openMVPanel() {
   setPlaying(false);
 
   const cached = getMVCache(track.name, track.artist || '');
-  if (cached && cached.videoUrl) {
-    showInlineMV(cached.videoUrl, cached.accept, cached.title, cached.lastPosition || 0);
+  if (cached && cached.bvid) {
+    showInlineMV('', [], cached.title, cached.lastPosition || 0, cached.bvid);
     return;
   }
 
   try {
     const result = await fetchBiliMV(track.name, track.artist || '');
     setMVCache(track.name, track.artist || '', result);
-    showInlineMV(result.video_url, result.accept, result.title || `${track.name} MV`, 0);
+    showInlineMV('', [], result.title || `${track.name} MV`, 0, result.bvid);
   } catch (e) {
     inner.innerHTML = `<div class="mv-loading mv-error">${esc(e.message) || '搜索失败，请检查网络'}</div>`;
   }
@@ -1420,6 +1450,8 @@ async function playNextMV() {
   if (state.playlist.length === 0) return;
 
   if (state.repeat === 'one') {
+    const iframe = $('inlineMVIframe');
+    if (iframe) { iframe.src = iframe.src; } // reload
     const vid = $('inlineMVVideo');
     if (vid) { vid.currentTime = 0; vid.play().catch(() => { }); }
     return;
@@ -1441,15 +1473,15 @@ async function playNextMV() {
   if (!track) return;
 
   const cached = getMVCache(track.name, track.artist || '');
-  if (cached && cached.videoUrl) {
-    showInlineMV(cached.videoUrl, cached.accept, cached.title, cached.lastPosition || 0);
+  if (cached && cached.bvid) {
+    showInlineMV('', [], cached.title, cached.lastPosition || 0, cached.bvid);
     return;
   }
 
   try {
     const result = await fetchBiliMV(track.name, track.artist || '');
     setMVCache(track.name, track.artist || '', result);
-    showInlineMV(result.video_url, result.accept, result.title || `${track.name} MV`, 0);
+    showInlineMV('', [], result.title || `${track.name} MV`, 0, result.bvid);
   } catch {
     audio.play().then(() => setPlaying(true)).catch(() => { });
   }

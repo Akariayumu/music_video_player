@@ -118,11 +118,40 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/song/url', async (req, res) => {
   try {
     const api = await getAPI();
-    const { id, br = 128000 } = req.query;
+    const { id, br = 128000, name, artist } = req.query;
     if (!id) return res.json({ code: 400, message: 'id required' });
 
     const result = await api.song_url({ id, br: parseInt(br), cookie: '' });
-    res.json(result.body || result);
+    const body = result.body || result;
+    const item = (body.data || [])[0];
+
+    // If Netease returned a URL, use it
+    if (item?.url) {
+      return res.json(body);
+    }
+
+    // Fallback: use yaohud Kuwo API (works from overseas)
+    if (name) {
+      try {
+        const msg = artist ? `${name} ${artist}` : name;
+        const sizeMap = { 128000: 'standard', 320000: 'exhigh', 999000: 'SQ' };
+        const size = sizeMap[parseInt(br)] || 'standard';
+        const kuwoData = await kuwoRequest({ msg, n: 1, size });
+        const kuwoUrl = kuwoData?.data?.vipmusic?.url || null;
+        if (kuwoUrl) {
+          console.log(`[song/url] Netease returned null for "${name}", using Kuwo fallback`);
+          return res.json({
+            code: 200,
+            data: [{ id, url: kuwoUrl, br: parseInt(br), source: 'kuwo' }],
+          });
+        }
+      } catch (kuwoErr) {
+        console.error('Kuwo fallback error:', kuwoErr.message);
+      }
+    }
+
+    // All sources failed
+    res.json(body);
   } catch (err) {
     console.error('Song URL error:', err.message);
     res.status(500).json({ code: 500, message: err.message });
@@ -356,6 +385,34 @@ app.get('/api/bilibili/mir6', async (req, res) => {
     });
   } catch (err) {
     console.error('Bili parse error:', err.message);
+    res.status(500).json({ code: 500, message: err.message });
+  }
+});
+
+// ==================== Netease WeAPI Proxy ====================
+// Browser sends encrypted params; server forwards to music.163.com
+// This bypasses CORS while keeping encryption logic client-side
+app.post('/api/netease/weapi', async (req, res) => {
+  try {
+    const { path, params, encSecKey } = req.body;
+    if (!path || !params || !encSecKey) {
+      return res.status(400).json({ code: 400, message: 'Missing path/params/encSecKey' });
+    }
+    const form = new URLSearchParams({ params, encSecKey });
+    const response = await fetch(`https://music.163.com/weapi${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Referer': 'https://music.163.com/',
+      },
+      body: form.toString(),
+    });
+    const text = await response.text();
+    res.setHeader('Content-Type', 'application/json');
+    res.send(text);
+  } catch (err) {
+    console.error('Netease weapi proxy error:', err.message);
     res.status(500).json({ code: 500, message: err.message });
   }
 });
