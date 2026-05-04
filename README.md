@@ -54,3 +54,10 @@ npm start
 └── js/
     └── app.js      # 前端逻辑
 ```
+
+## 注意事项
+
+### MV 功能
+Bilibili MV 搜索依赖 yaohud API（`api.yaohud.cn`），需要设置 `KUWO_API_KEY` 环境变量。部分歌曲（特别是日文 Vocaloid/Project Sekai）可能无法匹配到 B 站 MV。
+
+详细审计记录见 `CODEX_AUDIT.md`。
